@@ -1,0 +1,1662 @@
+#!/usr/bin/env python3
+"""
+decodex (DeCodex): Human-readable translation, orchestration, and low-token
+dispatch bridge over Codex's shared `app-server` JSON-RPC daemon.
+
+Zero third-party dependencies (Python 3 stdlib only).
+Connects directly to Codex's shared app-server daemon:
+  - local: ~/.codex/app-server-control/app-server-control.sock (Unix WebSocket)
+  - remote SSH hosts: via `codex app-server proxy` over SSH
+
+Subcommands:
+  projects  - List/search existing local & remote Codex App projects
+  start     - Create a `✦` thread in an existing project, start turn, optionally watch
+  watch     - Event-driven silent wait (0-token polling); wakes on mid-turn question,
+              Guardian denial, turn completion, failure, or disconnect
+  steer     - Mid-turn non-interrupting guidance (`turn/steer`, auto-falls back to `turn/start`)
+  queue     - Queue next-turn follow-up via native `codex queue`
+  approve   - Approve pending Guardian-denied action (`thread/approveGuardianDeniedAction`)
+  interrupt - Interrupt an active turn (`turn/interrupt`)
+  status    - Read thread/turn status and save latest assistant message locally
+  inspect   - Inspect saved last message or fetch recent thread items
+  doctor    - Check local/remote daemon versions and app-server RPC schema compatibility
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import select
+import shlex
+import shutil
+import socket
+import sqlite3
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+DECODEX_HOME = Path(os.environ.get("DECODEX_HOME", str(Path.home() / ".decodex")))
+LOCAL_SOCK = CODEX_HOME / "app-server-control" / "app-server-control.sock"
+GLOBAL_STATE = CODEX_HOME / ".codex-global-state.json"
+LOCAL_SQLITE = CODEX_HOME / "state_5.sqlite"
+TITLE_PREFIX = os.environ.get("DECODEX_TITLE_PREFIX", "✦")
+
+BUNDLED_MAC_CODEX = Path(
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+)
+DAEMON_MANAGED_CODEX = CODEX_HOME / "packages" / "app-server-daemon" / "current" / "bin" / "codex"
+
+REMOTE_PATH_SETUP = (
+    'for d in "$HOME/.codex/packages/app-server-daemon/current/bin" '
+    '"$HOME/.local/bin" "$HOME/.nvm/versions/node"/*/bin /usr/local/bin; do '
+    '[ -d "$d" ] && PATH="$d:$PATH"; '
+    "done; export PATH"
+)
+
+QUESTION_CUES = (
+    "[ASK_USER]",
+    "请确认",
+    "请问",
+    "请选择",
+    "你希望",
+    "你要不要",
+    "要不要",
+    "是否需要",
+    "是否要",
+    "请你决定",
+    "please confirm",
+    "would you like",
+    "which option",
+    "let me know",
+)
+
+
+class DeCodexError(RuntimeError):
+    pass
+
+
+class ConnectionClosed(DeCodexError):
+    pass
+
+
+def find_local_codex_bin() -> str:
+    env_bin = os.environ.get("DECODEX_CODEX_BIN")
+    if env_bin and Path(env_bin).is_file() and os.access(env_bin, os.X_OK):
+        return env_bin
+    for candidate in (DAEMON_MANAGED_CODEX, BUNDLED_MAC_CODEX):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    found = shutil.which("codex")
+    if found:
+        return found
+    raise DeCodexError("Cannot find local `codex` binary. Set DECODEX_CODEX_BIN or add `codex` to PATH.")
+
+
+def ensure_local_daemon() -> None:
+    if LOCAL_SOCK.exists():
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.settimeout(2.0)
+            s.connect(str(LOCAL_SOCK))
+            s.close()
+            return
+        except PermissionError as e:
+            s.close()
+            raise DeCodexError(
+                f"Permission denied connecting to {LOCAL_SOCK} (sandbox restriction; re-run outside sandbox)."
+            ) from e
+        except OSError:
+            s.close()
+    codex_bin = find_local_codex_bin()
+    try:
+        proc = subprocess.run(
+            [codex_bin, "app-server", "daemon", "start"],
+            capture_output=True,
+            text=True,
+            timeout=25,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise DeCodexError(
+            "Timed out starting local codex app-server daemon (if running inside sandbox, re-run outside sandbox)."
+        ) from e
+    if proc.returncode != 0:
+        raise DeCodexError(
+            f"Failed to start local codex app-server daemon: {proc.stderr.strip() or proc.stdout.strip()}"
+        )
+
+
+def read_prompt_arg(prompt: Optional[str], prompt_file: Optional[str]) -> str:
+    if prompt_file:
+        if prompt_file == "-":
+            text = sys.stdin.read()
+        else:
+            text = Path(prompt_file).read_text(encoding="utf-8")
+        if prompt:
+            text = prompt + "\n\n" + text
+        return text.strip()
+    if prompt is not None:
+        return prompt.strip()
+    if not sys.stdin.isatty():
+        return sys.stdin.read().strip()
+    raise DeCodexError("Provide --prompt, --prompt-file, or stdin.")
+
+
+def thread_cache_dir(thread_id: str) -> Path:
+    d = DECODEX_HOME / "threads" / thread_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def save_json(path: Path, obj: Any) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def save_text(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def emit_json(obj: Any) -> None:
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False, indent=2) + "\n")
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Project Discovery (Local + Remote via Codex Global State & SQLite)
+# ---------------------------------------------------------------------------
+
+
+def load_projects(host_filter: str = "all", query: Optional[str] = None) -> List[Dict[str, Any]]:
+    projects: List[Dict[str, Any]] = []
+    seen = set()
+
+    def add_project(host: str, name: str, path: str, source: str, project_id: Optional[str] = None) -> None:
+        if not path:
+            return
+        key = (host, path)
+        if key in seen:
+            return
+        seen.add(key)
+        projects.append(
+            {
+                "host": host,
+                "name": name or Path(path).name,
+                "path": path,
+                "projectId": project_id,
+                "source": source,
+            }
+        )
+
+    if GLOBAL_STATE.is_file():
+        try:
+            gs = json.loads(GLOBAL_STATE.read_text(encoding="utf-8"))
+        except Exception:
+            gs = {}
+
+        lp = gs.get("local-projects")
+        if isinstance(lp, dict):
+            for pid, item in lp.items():
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name") or ""
+                roots = item.get("rootPaths") or []
+                for rp in roots:
+                    add_project("local", name, rp, "global-state", pid)
+
+        rp_list = gs.get("remote-projects")
+        if isinstance(rp_list, list):
+            for item in rp_list:
+                if not isinstance(item, dict):
+                    continue
+                host_id = item.get("hostId") or ""
+                host = host_id.split(":", 1)[-1] if ":" in host_id else host_id
+                label = item.get("label") or item.get("name") or ""
+                rpath = item.get("remotePath") or item.get("path") or ""
+                add_project(host, label, rpath, "global-state", item.get("id"))
+
+    if LOCAL_SQLITE.is_file():
+        try:
+            con = sqlite3.connect(f"file:{LOCAL_SQLITE}?mode=ro", uri=True)
+            rows = con.execute(
+                "SELECT p.id, p.name, r.path FROM projects p JOIN project_roots r ON p.id = r.project_id"
+            ).fetchall()
+            con.close()
+            for pid, name, path in rows:
+                add_project("local", name, path, "sqlite", pid)
+        except Exception:
+            pass
+
+    if host_filter and host_filter != "all":
+        projects = [p for p in projects if p["host"] == host_filter]
+
+    if query:
+        q = query.lower()
+        projects = [
+            p
+            for p in projects
+            if q in p["name"].lower() or q in p["path"].lower() or q in p["host"].lower()
+        ]
+
+    projects.sort(key=lambda p: (0 if p["host"] == "local" else 1, p["host"], p["name"].lower()))
+    return projects
+
+
+def resolve_project_dir(host: str, directory: Optional[str], project_query: Optional[str]) -> Tuple[str, str]:
+    if directory:
+        return directory, Path(directory).name
+    if not project_query:
+        raise DeCodexError("Provide either --dir or --project.")
+    matches = load_projects(host_filter=host, query=project_query)
+    exact = [
+        m
+        for m in matches
+        if m["name"].lower() == project_query.lower() or m["path"] == project_query
+    ]
+    if len(exact) == 1:
+        return exact[0]["path"], exact[0]["name"]
+    if len(matches) == 1:
+        return matches[0]["path"], matches[0]["name"]
+    if not matches:
+        raise DeCodexError(
+            f"No project matched '{project_query}' on host '{host}'. Run `decodex projects --host {host}`."
+        )
+    choices = ", ".join(f"{m['name']} ({m['path']})" for m in matches[:8])
+    raise DeCodexError(f"Ambiguous project '{project_query}' on host '{host}': {choices}")
+
+
+# ---------------------------------------------------------------------------
+# WebSocket JSON-RPC Client (Unix socket for local, SSH proxy for remote)
+# ---------------------------------------------------------------------------
+
+
+class RawStream:
+    def read_some(self, n: int, timeout: Optional[float] = None) -> bytes:
+        raise NotImplementedError
+
+    def write_all(self, data: bytes) -> None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+
+class UnixSocketStream(RawStream):
+    def __init__(self, sock_path: Path):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(str(sock_path))
+
+    def read_some(self, n: int, timeout: Optional[float] = None) -> bytes:
+        r, _, _ = select.select([self.sock], [], [], timeout)
+        if not r:
+            raise TimeoutError("read timeout")
+        data = self.sock.recv(n)
+        if not data:
+            raise ConnectionClosed("Local app-server socket closed")
+        return data
+
+    def write_all(self, data: bytes) -> None:
+        self.sock.sendall(data)
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+class SSHProxyStream(RawStream):
+    def __init__(self, host: str):
+        remote_cmd = (
+            f"{REMOTE_PATH_SETUP}; "
+            "codex app-server daemon version >/dev/null 2>&1 || codex app-server daemon start >/dev/null 2>&1; "
+            "exec codex app-server proxy"
+        )
+        self.proc = subprocess.Popen(
+            [
+                "ssh",
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=4",
+                host,
+                remote_cmd,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        assert self.proc.stdin is not None and self.proc.stdout is not None
+        self._out_fd = self.proc.stdout.fileno()
+        self._in = self.proc.stdin
+        self._err = self.proc.stderr
+
+    def read_some(self, n: int, timeout: Optional[float] = None) -> bytes:
+        r, _, _ = select.select([self._out_fd], [], [], timeout)
+        if not r:
+            raise TimeoutError("read timeout")
+        data = os.read(self._out_fd, n)
+        if not data:
+            err_msg = ""
+            if self._err is not None:
+                try:
+                    rr, _, _ = select.select([self._err.fileno()], [], [], 0.1)
+                    if rr:
+                        err_msg = os.read(self._err.fileno(), 4096).decode("utf-8", errors="replace").strip()
+                except Exception:
+                    pass
+            raise ConnectionClosed(f"SSH proxy stream closed{': ' + err_msg if err_msg else ''}")
+        return data
+
+    def write_all(self, data: bytes) -> None:
+        try:
+            self._in.write(data)
+            self._in.flush()
+        except BrokenPipeError as e:
+            raise ConnectionClosed("SSH proxy stdin closed") from e
+
+    def close(self) -> None:
+        try:
+            if self.proc.poll() is None:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=1.5)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+        except Exception:
+            pass
+
+
+class AppServerClient:
+    def __init__(self, host: str):
+        self.host = host
+        self._buf = bytearray()
+        self._next_id = 1
+        self._queued_messages: List[Dict[str, Any]] = []
+        if host == "local":
+            ensure_local_daemon()
+            self.stream: RawStream = UnixSocketStream(LOCAL_SOCK)
+        else:
+            self.stream = SSHProxyStream(host)
+        self._ws_handshake()
+        self._rpc_initialize()
+
+    def _read_exact(self, n: int, timeout: Optional[float] = None) -> bytes:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while len(self._buf) < n:
+            rem = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if rem is not None and rem <= 0:
+                raise TimeoutError("read_exact timeout")
+            chunk = self.stream.read_some(max(4096, n - len(self._buf)), timeout=rem)
+            self._buf.extend(chunk)
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        return out
+
+    def _ws_handshake(self) -> None:
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        req = (
+            "GET / HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode("ascii")
+        self.stream.write_all(req)
+        deadline = time.monotonic() + 15.0
+        while b"\r\n\r\n" not in self._buf:
+            rem = max(0.1, deadline - time.monotonic())
+            if rem <= 0.1 and time.monotonic() >= deadline:
+                raise DeCodexError("Timed out waiting for WebSocket handshake from app-server")
+            chunk = self.stream.read_some(4096, timeout=rem)
+            self._buf.extend(chunk)
+        idx = self._buf.index(b"\r\n\r\n") + 4
+        header = bytes(self._buf[:idx]).decode("utf-8", errors="replace")
+        del self._buf[:idx]
+        if "101 " not in header.splitlines()[0]:
+            raise DeCodexError(f"WebSocket handshake failed: {header.splitlines()[0]}")
+
+    def _send_ws_frame(self, opcode: int, payload: bytes) -> None:
+        mask = os.urandom(4)
+        header = bytearray([0x80 | (opcode & 0x0F)])
+        n = len(payload)
+        if n < 126:
+            header.append(0x80 | n)
+        elif n < 65536:
+            header.append(0x80 | 126)
+            header.extend(struct.pack("!H", n))
+        else:
+            header.append(0x80 | 127)
+            header.extend(struct.pack("!Q", n))
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self.stream.write_all(bytes(header) + mask + masked)
+
+    def send_json(self, obj: Dict[str, Any]) -> None:
+        self._send_ws_frame(0x1, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+    def recv_json(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+        if self._queued_messages:
+            return self._queued_messages.pop(0)
+        return self._recv_ws_json(timeout=timeout)
+
+    def _recv_ws_json(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+        fragments = bytearray()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            rem = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if rem is not None and rem <= 0:
+                raise TimeoutError("recv_json timeout")
+            b1, b2 = self._read_exact(2, timeout=rem)
+            fin = (b1 & 0x80) != 0
+            opcode = b1 & 0x0F
+            masked = (b2 & 0x80) != 0
+            length = b2 & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", self._read_exact(2, timeout=rem))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._read_exact(8, timeout=rem))[0]
+            mask_key = self._read_exact(4, timeout=rem) if masked else b""
+            payload = self._read_exact(length, timeout=rem) if length else b""
+            if masked:
+                payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+
+            if opcode == 0x9:  # Ping -> reply Pong
+                self._send_ws_frame(0xA, payload)
+                continue
+            if opcode == 0xA:  # Pong
+                continue
+            if opcode == 0x8:  # Close
+                raise ConnectionClosed("WebSocket closed by app-server")
+            if opcode in (0x1, 0x2, 0x0):
+                fragments.extend(payload)
+                if fin:
+                    return json.loads(fragments.decode("utf-8"))
+
+    def request(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 30.0) -> Any:
+        req_id = self._next_id
+        self._next_id += 1
+        msg: Dict[str, Any] = {"jsonrpc": "2.0", "id": req_id, "method": method}
+        if params is not None:
+            msg["params"] = params
+        self.send_json(msg)
+        deadline = time.monotonic() + timeout
+        while True:
+            rem = max(0.05, deadline - time.monotonic())
+            incoming = self._recv_ws_json(timeout=rem)
+            if incoming.get("id") == req_id and "method" not in incoming:
+                if "error" in incoming:
+                    err = incoming["error"]
+                    raise DeCodexError(f"RPC {method} error: {json.dumps(err, ensure_ascii=False)}")
+                return incoming.get("result")
+            self._queued_messages.append(incoming)
+
+    def notify(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
+        msg: Dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            msg["params"] = params
+        self.send_json(msg)
+
+    def _rpc_initialize(self) -> None:
+        self.request(
+            "initialize",
+            {
+                "clientInfo": {"name": "decodex", "version": "1.0.0"},
+                "capabilities": {"experimentalApi": True},
+            },
+            timeout=15.0,
+        )
+        self.notify("initialized")
+
+    def close(self) -> None:
+        self.stream.close()
+
+
+# ---------------------------------------------------------------------------
+# Event Analysis Helpers
+# ---------------------------------------------------------------------------
+
+
+def is_mid_turn_question_item(item: Dict[str, Any]) -> bool:
+    if item.get("type") != "agentMessage":
+        return False
+    if item.get("questions"):
+        return True
+    if item.get("delivery") == "async":
+        return True
+    text = item.get("text") or ""
+    if "[ASK_USER]" in text:
+        return True
+    phase = item.get("phase")
+    if phase == "commentary" and ("?" in text or "？" in text):
+        low = text.lower()
+        if any(cue.lower() in low for cue in QUESTION_CUES):
+            return True
+    return False
+
+
+def extract_latest_agent_message(turns: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
+    for turn in reversed(turns):
+        items = turn.get("items") or []
+        for item in reversed(items):
+            if item.get("type") == "agentMessage" and item.get("text"):
+                return item.get("id"), item.get("text")
+    return None, None
+
+
+def get_active_turn_id(thread_obj: Dict[str, Any]) -> Optional[str]:
+    turns = thread_obj.get("turns") or []
+    for turn in reversed(turns):
+        status = (turn.get("status") or "").lower()
+        if status in ("inprogress", "in_progress", "running", "active"):
+            return turn.get("id")
+    return None
+
+
+def get_git_status_summary(host: str, cwd: Optional[str]) -> Optional[str]:
+    if not cwd:
+        return None
+    try:
+        if host == "local":
+            proc = subprocess.run(
+                ["git", "-C", cwd, "status", "--short"],
+                capture_output=True,
+                text=True,
+                timeout=4,
+            )
+        else:
+            proc = subprocess.run(
+                [
+                    "ssh",
+                    "-T",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=4",
+                    host,
+                    f"git -C {shlex.quote(cwd)} status --short 2>/dev/null || true",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=6,
+            )
+        if proc.returncode == 0:
+            lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+            if not lines:
+                return ""
+            if len(lines) > 20:
+                return "\n".join(lines[:20]) + f"\n... (+{len(lines) - 20} more)"
+            return "\n".join(lines)
+    except Exception:
+        pass
+    return None
+
+
+def truncate_preview(text: str, max_chars: int = 1600) -> Tuple[str, bool]:
+    if len(text) <= max_chars:
+        return text, False
+    return text[:max_chars] + f"\n... [truncated, total {len(text)} chars; see full text file]", True
+
+
+def build_envelope(
+    event: str,
+    host: str,
+    thread_id: str,
+    *,
+    turn_id: Optional[str] = None,
+    cursor_item_id: Optional[str] = None,
+    cwd: Optional[str] = None,
+    title: Optional[str] = None,
+    message: str = "",
+    questions: Any = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    cdir = thread_cache_dir(thread_id)
+    msg_file = cdir / "last_message.md"
+    if message:
+        save_text(msg_file, message)
+    preview, truncated = truncate_preview(message) if message else ("", False)
+    env: Dict[str, Any] = {
+        "event": event,
+        "host": host,
+        "threadId": thread_id,
+        "turnId": turn_id,
+        "cursorItemId": cursor_item_id,
+        "cwd": cwd,
+        "title": title,
+        "messagePreview": preview,
+        "messageTruncated": truncated,
+        "fullMessagePath": str(msg_file) if message else None,
+    }
+    if questions:
+        env["questions"] = questions
+    if extra:
+        env.update(extra)
+    save_json(cdir / "last_event.json", env)
+    return env
+
+
+# ---------------------------------------------------------------------------
+# Watch Loop
+# ---------------------------------------------------------------------------
+
+
+def watch_thread(
+    client: AppServerClient,
+    thread_id: str,
+    *,
+    expected_turn_id: Optional[str] = None,
+    from_item_id: Optional[str] = None,
+    cwd: Optional[str] = None,
+    title: Optional[str] = None,
+    timeout: float = 0.0,
+    already_subscribed: bool = False,
+) -> Dict[str, Any]:
+    cdir = thread_cache_dir(thread_id)
+    if not already_subscribed:
+        resumed = client.request("thread/resume", {"threadId": thread_id, "excludeTurns": True})
+        tmeta = resumed.get("thread") or {}
+        cwd = cwd or tmeta.get("cwd")
+        title = title or tmeta.get("name") or tmeta.get("preview")
+
+        read_res = client.request("thread/read", {"threadId": thread_id, "includeTurns": True})
+        thread_obj = read_res.get("thread") or {}
+        cwd = cwd or thread_obj.get("cwd")
+        title = title or thread_obj.get("name")
+        turns = thread_obj.get("turns") or []
+        if turns:
+            latest_turn = turns[-1]
+            lt_id = latest_turn.get("id")
+            lt_status = (latest_turn.get("status") or "").lower()
+            items = latest_turn.get("items") or []
+
+            seen_anchor = from_item_id is None
+            for it in items:
+                it_id = it.get("id")
+                if not seen_anchor:
+                    if it_id == from_item_id:
+                        seen_anchor = True
+                    continue
+                if is_mid_turn_question_item(it) and lt_status in ("inprogress", "in_progress", "running", "active"):
+                    return build_envelope(
+                        "MID_TURN_QUESTION",
+                        client.host,
+                        thread_id,
+                        turn_id=lt_id,
+                        cursor_item_id=it_id,
+                        cwd=cwd,
+                        title=title,
+                        message=it.get("text") or "",
+                        questions=it.get("questions"),
+                        extra={"turnStillRunning": True, "source": "catchup"},
+                    )
+
+            if lt_status in ("completed", "failed", "interrupted"):
+                last_item_id, last_text = extract_latest_agent_message([latest_turn])
+                if from_item_id is None or last_item_id != from_item_id:
+                    ev = "TURN_DONE" if lt_status == "completed" else "FAILED"
+                    return build_envelope(
+                        ev,
+                        client.host,
+                        thread_id,
+                        turn_id=lt_id,
+                        cursor_item_id=last_item_id,
+                        cwd=cwd,
+                        title=title,
+                        message=last_text or "",
+                        extra={
+                            "turnStatus": latest_turn.get("status"),
+                            "turnError": latest_turn.get("error"),
+                            "gitStatus": get_git_status_summary(client.host, cwd),
+                            "source": "catchup",
+                        },
+                    )
+            expected_turn_id = expected_turn_id or lt_id
+
+    last_agent_text = ""
+    last_agent_item_id = from_item_id
+    current_turn_id = expected_turn_id
+    deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
+
+    while True:
+        rem = None if deadline is None else max(0.1, deadline - time.monotonic())
+        if deadline is not None and time.monotonic() >= deadline:
+            return build_envelope(
+                "WATCH_TIMEOUT",
+                client.host,
+                thread_id,
+                turn_id=current_turn_id,
+                cursor_item_id=last_agent_item_id,
+                cwd=cwd,
+                title=title,
+                message=last_agent_text,
+                extra={"turnStillRunning": True},
+            )
+        try:
+            msg = client.recv_json(timeout=rem)
+        except TimeoutError:
+            continue
+        except ConnectionClosed as e:
+            return build_envelope(
+                "DISCONNECTED",
+                client.host,
+                thread_id,
+                turn_id=current_turn_id,
+                cursor_item_id=last_agent_item_id,
+                cwd=cwd,
+                title=title,
+                message=str(e),
+                extra={
+                    "turnStillRunning": True,
+                    "resumeHint": (
+                        f"decodex watch --host {client.host} --thread {thread_id}"
+                        + (f" --from-item {last_agent_item_id}" if last_agent_item_id else "")
+                    ),
+                },
+            )
+
+        method = msg.get("method")
+        if not method:
+            continue
+        params = msg.get("params") or {}
+
+        msg_tid = params.get("threadId")
+        if msg_tid is None and isinstance(params.get("thread"), dict):
+            msg_tid = params["thread"].get("id")
+        if msg_tid and msg_tid != thread_id:
+            continue
+
+        if method == "turn/started":
+            turn = params.get("turn") or {}
+            current_turn_id = turn.get("id") or params.get("turnId") or current_turn_id
+            continue
+
+        if method in ("item/tool/requestUserInput", "mcpServer/elicitation/request"):
+            req_id = msg.get("id")
+            is_blocking = params.get("isBlocking", True)
+            save_json(cdir / "pending_user_input.json", {"rpcId": req_id, "method": method, "params": params})
+            questions = params.get("questions") or params
+            return build_envelope(
+                "MID_TURN_QUESTION",
+                client.host,
+                thread_id,
+                turn_id=params.get("turnId") or current_turn_id,
+                cursor_item_id=params.get("itemId") or last_agent_item_id,
+                cwd=cwd,
+                title=title,
+                message=params.get("message") or "Codex requested structured user input.",
+                questions=questions,
+                extra={
+                    "rpcRequestId": req_id,
+                    "isBlocking": is_blocking,
+                    "turnStillRunning": True,
+                    "source": method,
+                },
+            )
+
+        if method in (
+            "item/autoApprovalReview/completed",
+            "autoApprovalReview/strictReviewRequired",
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
+        ):
+            is_denied = True
+            summary_text = ""
+            if method == "item/autoApprovalReview/completed":
+                review = params.get("review") or {}
+                r_status = str(review.get("status") or "").lower()
+                if r_status not in ("denied", "timedout", "aborted"):
+                    is_denied = False
+                else:
+                    summary_text = json.dumps(
+                        {
+                            "status": review.get("status"),
+                            "riskLevel": review.get("riskLevel"),
+                            "rationale": review.get("rationale"),
+                            "action": params.get("action"),
+                            "reviewId": params.get("reviewId"),
+                        },
+                        ensure_ascii=False,
+                    )
+            if is_denied:
+                save_json(cdir / "pending_guardian.json", {"method": method, "rpcId": msg.get("id"), "params": params})
+                return build_envelope(
+                    "GUARDIAN_DENIED",
+                    client.host,
+                    thread_id,
+                    turn_id=params.get("turnId") or current_turn_id,
+                    cursor_item_id=params.get("targetItemId") or params.get("itemId") or last_agent_item_id,
+                    cwd=cwd,
+                    title=title,
+                    message=(summary_text or json.dumps(params, ensure_ascii=False))[:1600],
+                    extra={
+                        "guardianMethod": method,
+                        "pendingFile": str(cdir / "pending_guardian.json"),
+                        "turnStillRunning": True,
+                    },
+                )
+            continue
+
+        if method == "item/completed":
+            item = params.get("item") or {}
+            if item.get("type") == "agentMessage":
+                it_id = item.get("id")
+                text = item.get("text") or ""
+                if text:
+                    last_agent_text = text
+                    last_agent_item_id = it_id
+                if it_id != from_item_id and is_mid_turn_question_item(item):
+                    return build_envelope(
+                        "MID_TURN_QUESTION",
+                        client.host,
+                        thread_id,
+                        turn_id=params.get("turnId") or current_turn_id,
+                        cursor_item_id=it_id,
+                        cwd=cwd,
+                        title=title,
+                        message=text,
+                        questions=item.get("questions"),
+                        extra={
+                            "delivery": item.get("delivery"),
+                            "phase": item.get("phase"),
+                            "turnStillRunning": True,
+                            "source": "item/completed",
+                        },
+                    )
+            continue
+
+        if method == "turn/completed":
+            turn = params.get("turn") or {}
+            t_id = turn.get("id") or current_turn_id
+            status = (turn.get("status") or "completed").lower()
+            if not last_agent_text:
+                lt_item_id, lt_text = extract_latest_agent_message([turn])
+                if lt_text:
+                    last_agent_text = lt_text
+                    last_agent_item_id = lt_item_id or last_agent_item_id
+            if not last_agent_text:
+                try:
+                    rr = client.request("thread/read", {"threadId": thread_id, "includeTurns": True}, timeout=10.0)
+                    lt_item_id, lt_text = extract_latest_agent_message((rr.get("thread") or {}).get("turns") or [])
+                    if lt_text:
+                        last_agent_text = lt_text
+                        last_agent_item_id = lt_item_id or last_agent_item_id
+                except Exception:
+                    pass
+            ev = "TURN_DONE" if status == "completed" else "FAILED"
+            return build_envelope(
+                ev,
+                client.host,
+                thread_id,
+                turn_id=t_id,
+                cursor_item_id=last_agent_item_id,
+                cwd=cwd,
+                title=title,
+                message=last_agent_text,
+                extra={
+                    "turnStatus": turn.get("status"),
+                    "turnError": turn.get("error"),
+                    "gitStatus": get_git_status_summary(client.host, cwd),
+                },
+            )
+
+
+# ---------------------------------------------------------------------------
+# Subcommand Handlers
+# ---------------------------------------------------------------------------
+
+
+def cmd_projects(args: argparse.Namespace) -> None:
+    items = load_projects(host_filter=args.host, query=args.query)
+    emit_json({"count": len(items), "projects": items})
+
+
+def cmd_start(args: argparse.Namespace) -> None:
+    cwd, proj_name = resolve_project_dir(args.host, args.dir, args.project)
+    prompt = read_prompt_arg(args.prompt, args.prompt_file)
+    raw_title = (args.title or prompt.splitlines()[0][:40]).strip()
+    title = raw_title if raw_title.startswith(TITLE_PREFIX) else f"{TITLE_PREFIX} {raw_title}"
+
+    client = AppServerClient(args.host)
+    try:
+        start_params: Dict[str, Any] = {
+            "cwd": cwd,
+            "ephemeral": False,
+            "threadSource": "user",
+            "approvalPolicy": args.approval_policy,
+            "approvalsReviewer": args.approvals_reviewer,
+        }
+        if args.model:
+            start_params["model"] = args.model
+        if args.sandbox:
+            start_params["sandbox"] = args.sandbox
+
+        res = client.request("thread/start", start_params)
+        thread = res.get("thread") or {}
+        thread_id = thread.get("id")
+        if not thread_id:
+            raise DeCodexError(f"thread/start did not return thread.id: {res}")
+
+        try:
+            client.request("thread/name/set", {"threadId": thread_id, "name": title})
+        except Exception:
+            pass
+
+        turn_params: Dict[str, Any] = {
+            "threadId": thread_id,
+            "cwd": cwd,
+            "input": [{"type": "text", "text": prompt}],
+            "approvalPolicy": args.approval_policy,
+            "approvalsReviewer": args.approvals_reviewer,
+        }
+        if args.model:
+            turn_params["model"] = args.model
+        if args.effort:
+            turn_params["effort"] = args.effort
+
+        turn_res = client.request("turn/start", turn_params)
+        turn = turn_res.get("turn") or {}
+        turn_id = turn.get("id")
+
+        save_json(
+            thread_cache_dir(thread_id) / "meta.json",
+            {
+                "host": args.host,
+                "threadId": thread_id,
+                "cwd": cwd,
+                "projectName": proj_name,
+                "title": title,
+                "createdAt": int(time.time()),
+            },
+        )
+
+        if not args.watch:
+            emit_json(
+                {
+                    "event": "STARTED",
+                    "host": args.host,
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "cwd": cwd,
+                    "title": title,
+                }
+            )
+            return
+
+        env = watch_thread(
+            client,
+            thread_id,
+            expected_turn_id=turn_id,
+            cwd=cwd,
+            title=title,
+            timeout=args.timeout,
+            already_subscribed=True,
+        )
+        emit_json(env)
+    finally:
+        client.close()
+
+
+def cmd_watch(args: argparse.Namespace) -> None:
+    client = AppServerClient(args.host)
+    try:
+        env = watch_thread(
+            client,
+            args.thread,
+            from_item_id=args.from_item,
+            timeout=args.timeout,
+            already_subscribed=False,
+        )
+        emit_json(env)
+    finally:
+        client.close()
+
+
+def cmd_steer(args: argparse.Namespace) -> None:
+    prompt = read_prompt_arg(args.prompt, args.prompt_file)
+    client = AppServerClient(args.host)
+    try:
+        resumed = client.request("thread/resume", {"threadId": args.thread, "excludeTurns": True})
+        tmeta = resumed.get("thread") or {}
+        cwd = tmeta.get("cwd")
+        title = tmeta.get("name")
+
+        read_res = client.request("thread/read", {"threadId": args.thread, "includeTurns": True})
+        thread_obj = read_res.get("thread") or {}
+        cwd = cwd or thread_obj.get("cwd")
+        title = title or thread_obj.get("name")
+        active_turn_id = get_active_turn_id(thread_obj)
+        last_item_id, _ = extract_latest_agent_message(thread_obj.get("turns") or [])
+
+        mode_used = "turn/start"
+        turn_id = active_turn_id
+
+        if active_turn_id:
+            try:
+                steer_res = client.request(
+                    "turn/steer",
+                    {
+                        "threadId": args.thread,
+                        "expectedTurnId": active_turn_id,
+                        "input": [{"type": "text", "text": prompt}],
+                    },
+                )
+                turn_id = steer_res.get("turnId") or active_turn_id
+                mode_used = "turn/steer"
+            except DeCodexError:
+                turn_res = client.request(
+                    "turn/start",
+                    {
+                        "threadId": args.thread,
+                        "input": [{"type": "text", "text": prompt}],
+                    },
+                )
+                turn_id = (turn_res.get("turn") or {}).get("id")
+                mode_used = "turn/start(fallback)"
+        else:
+            turn_res = client.request(
+                "turn/start",
+                {
+                    "threadId": args.thread,
+                    "input": [{"type": "text", "text": prompt}],
+                },
+            )
+            turn_id = (turn_res.get("turn") or {}).get("id")
+            mode_used = "turn/start"
+
+        if not args.watch:
+            emit_json(
+                {
+                    "event": "STEERED",
+                    "mode": mode_used,
+                    "host": args.host,
+                    "threadId": args.thread,
+                    "turnId": turn_id,
+                    "cwd": cwd,
+                    "title": title,
+                }
+            )
+            return
+
+        env = watch_thread(
+            client,
+            args.thread,
+            expected_turn_id=turn_id,
+            from_item_id=last_item_id,
+            cwd=cwd,
+            title=title,
+            timeout=args.timeout,
+            already_subscribed=True,
+        )
+        env["steerMode"] = mode_used
+        emit_json(env)
+    finally:
+        client.close()
+
+
+def cmd_queue(args: argparse.Namespace) -> None:
+    prompt = read_prompt_arg(args.prompt, args.prompt_file)
+    if args.host == "local":
+        ensure_local_daemon()
+        codex_bin = find_local_codex_bin()
+        cmd = [codex_bin, "queue", "--thread", args.thread, "--message", prompt, "--resume"]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    else:
+        b64 = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
+        remote_py = (
+            "import base64, subprocess, sys; "
+            f"msg = base64.b64decode({b64!r}).decode('utf-8'); "
+            f"r = subprocess.run(['codex', 'queue', '--thread', {args.thread!r}, '--message', msg, '--resume'], capture_output=True, text=True); "
+            "sys.stdout.write(r.stdout); sys.stderr.write(r.stderr); sys.exit(r.returncode)"
+        )
+        remote_cmd = f"{REMOTE_PATH_SETUP}; python3 -c {shlex.quote(remote_py)}"
+        proc = subprocess.run(
+            ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", args.host, remote_cmd],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    if proc.returncode != 0:
+        raise DeCodexError(f"codex queue failed (rc={proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}")
+    emit_json(
+        {
+            "event": "QUEUED",
+            "host": args.host,
+            "threadId": args.thread,
+            "stdout": proc.stdout.strip(),
+            "stderr": proc.stderr.strip(),
+        }
+    )
+
+
+def _camel_to_snake(name: str) -> str:
+    out = []
+    for i, ch in enumerate(name):
+        if ch.isupper() and i > 0:
+            out.append("_")
+        out.append(ch.lower())
+    return "".join(out)
+
+
+def _convert_guardian_action(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        res = {}
+        for k, v in obj.items():
+            sk = _camel_to_snake(k)
+            val = _convert_guardian_action(v)
+            if sk == "source" and isinstance(val, str) and val == "unifiedExec":
+                val = "unified_exec"
+            res[sk] = val
+        return res
+    if isinstance(obj, list):
+        return [_convert_guardian_action(x) for x in obj]
+    return obj
+
+
+def _build_guardian_assessment_event(params: Dict[str, Any]) -> Dict[str, Any]:
+    if "id" in params and "turn_id" in params and "status" in params:
+        return params
+    rev = params.get("review") or {}
+    return {
+        "id": params.get("reviewId"),
+        "target_item_id": params.get("targetItemId"),
+        "turn_id": params.get("turnId"),
+        "status": rev.get("status"),
+        "risk_level": rev.get("riskLevel"),
+        "user_authorization": rev.get("userAuthorization"),
+        "rationale": rev.get("rationale"),
+        "decision_source": params.get("decisionSource"),
+        "action": _convert_guardian_action(params.get("action")),
+    }
+
+
+def cmd_approve(args: argparse.Namespace) -> None:
+    cdir = thread_cache_dir(args.thread)
+    event_file = Path(args.event_file) if args.event_file else (cdir / "pending_guardian.json")
+    if not event_file.is_file():
+        raise DeCodexError(f"No pending Guardian denial file found at {event_file}")
+    pending = json.loads(event_file.read_text(encoding="utf-8"))
+    params = pending.get("params") or {}
+    guardian_event = _build_guardian_assessment_event(params)
+
+    client = AppServerClient(args.host)
+    try:
+        resumed = client.request("thread/resume", {"threadId": args.thread, "excludeTurns": True})
+        tmeta = resumed.get("thread") or {}
+        cwd = tmeta.get("cwd")
+        title = tmeta.get("name")
+
+        client.request(
+            "thread/approveGuardianDeniedAction",
+            {"threadId": args.thread, "event": guardian_event},
+        )
+
+        turn_id = None
+        continue_mode = "none"
+        last_item_id = None
+        if not args.no_continue:
+            follow_prompt = (
+                args.prompt
+                or "The user has explicitly approved the previously Guardian-denied action. Please proceed with that action and report the result."
+            )
+            read_res = client.request("thread/read", {"threadId": args.thread, "includeTurns": True})
+            thread_obj = read_res.get("thread") or {}
+            cwd = cwd or thread_obj.get("cwd")
+            title = title or thread_obj.get("name")
+            active_turn_id = get_active_turn_id(thread_obj)
+            last_item_id, _ = extract_latest_agent_message(thread_obj.get("turns") or [])
+
+            if active_turn_id:
+                try:
+                    sr = client.request(
+                        "turn/steer",
+                        {
+                            "threadId": args.thread,
+                            "expectedTurnId": active_turn_id,
+                            "input": [{"type": "text", "text": follow_prompt}],
+                        },
+                    )
+                    turn_id = sr.get("turnId") or active_turn_id
+                    continue_mode = "turn/steer"
+                except DeCodexError:
+                    tr = client.request(
+                        "turn/start",
+                        {"threadId": args.thread, "input": [{"type": "text", "text": follow_prompt}]},
+                    )
+                    turn_id = (tr.get("turn") or {}).get("id")
+                    continue_mode = "turn/start(fallback)"
+            else:
+                tr = client.request(
+                    "turn/start",
+                    {"threadId": args.thread, "input": [{"type": "text", "text": follow_prompt}]},
+                )
+                turn_id = (tr.get("turn") or {}).get("id")
+                continue_mode = "turn/start"
+
+        if not args.watch or args.no_continue:
+            emit_json(
+                {
+                    "event": "APPROVED",
+                    "host": args.host,
+                    "threadId": args.thread,
+                    "turnId": turn_id,
+                    "continueMode": continue_mode,
+                }
+            )
+            return
+
+        env = watch_thread(
+            client,
+            args.thread,
+            expected_turn_id=turn_id,
+            from_item_id=last_item_id,
+            cwd=cwd,
+            title=title,
+            timeout=args.timeout,
+            already_subscribed=True,
+        )
+        env["approvedGuardian"] = True
+        env["continueMode"] = continue_mode
+        emit_json(env)
+    finally:
+        client.close()
+
+
+def cmd_interrupt(args: argparse.Namespace) -> None:
+    client = AppServerClient(args.host)
+    try:
+        client.request("thread/resume", {"threadId": args.thread, "excludeTurns": True})
+        read_res = client.request("thread/read", {"threadId": args.thread, "includeTurns": True})
+        turn_id = args.turn or get_active_turn_id(read_res.get("thread") or {})
+        if not turn_id:
+            emit_json({"event": "NO_ACTIVE_TURN", "host": args.host, "threadId": args.thread})
+            return
+        client.request("turn/interrupt", {"threadId": args.thread, "turnId": turn_id})
+        emit_json({"event": "INTERRUPTED", "host": args.host, "threadId": args.thread, "turnId": turn_id})
+    finally:
+        client.close()
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    client = AppServerClient(args.host)
+    try:
+        read_res = client.request("thread/read", {"threadId": args.thread, "includeTurns": True})
+        thread_obj = read_res.get("thread") or {}
+        turns = thread_obj.get("turns") or []
+        latest_turn = turns[-1] if turns else {}
+        last_item_id, last_text = extract_latest_agent_message(turns)
+        env = build_envelope(
+            "STATUS",
+            args.host,
+            args.thread,
+            turn_id=latest_turn.get("id"),
+            cursor_item_id=last_item_id,
+            cwd=thread_obj.get("cwd"),
+            title=thread_obj.get("name") or thread_obj.get("preview"),
+            message=last_text or "",
+            extra={
+                "turnCount": len(turns),
+                "turnStatus": latest_turn.get("status"),
+                "turnError": latest_turn.get("error"),
+                "activeTurnId": get_active_turn_id(thread_obj),
+                "gitStatus": get_git_status_summary(args.host, thread_obj.get("cwd")),
+            },
+        )
+        emit_json(env)
+    finally:
+        client.close()
+
+
+def cmd_inspect(args: argparse.Namespace) -> None:
+    if args.saved:
+        p = thread_cache_dir(args.thread) / "last_message.md"
+        if not p.is_file():
+            raise DeCodexError(f"No saved message at {p}")
+        sys.stdout.write(p.read_text(encoding="utf-8") + "\n")
+        return
+    client = AppServerClient(args.host)
+    try:
+        res = client.request(
+            "thread/items/list",
+            {"threadId": args.thread, "limit": args.limit, "sortDirection": "desc"},
+        )
+        items = list(reversed(res.get("data") or res.get("items") or []))
+        compact = []
+        for raw in items:
+            it = raw.get("item") if isinstance(raw, dict) and isinstance(raw.get("item"), dict) else raw
+            if not isinstance(it, dict):
+                continue
+            entry: Dict[str, Any] = {
+                "id": it.get("id") or raw.get("id"),
+                "turnId": raw.get("turnId") if isinstance(raw, dict) else None,
+                "type": it.get("type"),
+            }
+            if it.get("type") == "agentMessage":
+                entry["phase"] = it.get("phase")
+                entry["delivery"] = it.get("delivery")
+                entry["questions"] = it.get("questions")
+                entry["text"] = it.get("text")
+            elif it.get("type") == "userMessage":
+                entry["content"] = it.get("content")
+            elif it.get("type") == "commandExecution":
+                entry["command"] = it.get("command")
+                entry["status"] = it.get("status")
+                entry["exitCode"] = it.get("exitCode")
+            elif it.get("type") == "fileChange":
+                entry["status"] = it.get("status")
+                entry["changes"] = [c.get("path") for c in (it.get("changes") or []) if isinstance(c, dict)]
+            compact.append(entry)
+        emit_json({"host": args.host, "threadId": args.thread, "items": compact})
+    finally:
+        client.close()
+
+
+def _extract_schema_methods(schema_file: Path) -> set:
+    if not schema_file.is_file():
+        return set()
+    d = json.loads(schema_file.read_text(encoding="utf-8"))
+    out = set()
+    for item in d.get("oneOf", []):
+        m = (item.get("properties") or {}).get("method") or {}
+        if "const" in m:
+            out.add(m["const"])
+        for v in m.get("enum") or []:
+            out.add(v)
+    return out
+
+
+def _check_local_schema(codex_bin: str) -> Dict[str, Any]:
+    required_client = {
+        "thread/start",
+        "thread/resume",
+        "thread/name/set",
+        "thread/read",
+        "thread/items/list",
+        "turn/start",
+        "turn/steer",
+        "turn/interrupt",
+        "thread/approveGuardianDeniedAction",
+    }
+    required_notif = {
+        "turn/started",
+        "turn/completed",
+        "item/completed",
+        "item/autoApprovalReview/completed",
+        "autoApprovalReview/strictReviewRequired",
+        "thread/queue/changed",
+    }
+    required_server_req = {
+        "item/tool/requestUserInput",
+        "item/commandExecution/requestApproval",
+    }
+    with tempfile.TemporaryDirectory(prefix="decodex-schema-") as td:
+        proc = subprocess.run(
+            [codex_bin, "app-server", "generate-json-schema", "--out", td],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if proc.returncode != 0:
+            return {"ok": False, "error": proc.stderr.strip() or proc.stdout.strip()}
+        tdp = Path(td)
+        client_m = _extract_schema_methods(tdp / "ClientRequest.json")
+        notif_m = _extract_schema_methods(tdp / "ServerNotification.json")
+        sreq_m = _extract_schema_methods(tdp / "ServerRequest.json")
+
+        missing_client = sorted(required_client - client_m)
+        missing_notif = sorted(required_notif - notif_m)
+        missing_sreq = sorted(required_server_req - sreq_m)
+
+        field_checks: Dict[str, bool] = {}
+        try:
+            ic = json.loads((tdp / "v2" / "ItemCompletedNotification.json").read_text(encoding="utf-8"))
+            agent_props = {}
+            for opt in (ic.get("definitions") or {}).get("ThreadItem", {}).get("oneOf", []):
+                if (opt.get("properties") or {}).get("type", {}).get("enum") == ["agentMessage"]:
+                    agent_props = opt.get("properties") or {}
+            field_checks["agentMessage.questions"] = "questions" in agent_props
+            field_checks["agentMessage.delivery"] = "delivery" in agent_props
+        except Exception:
+            field_checks["agentMessage.schema"] = False
+
+        try:
+            ts = json.loads((tdp / "v2" / "TurnSteerParams.json").read_text(encoding="utf-8"))
+            field_checks["turnSteer.expectedTurnId"] = "expectedTurnId" in (ts.get("properties") or {})
+        except Exception:
+            field_checks["turnSteer.schema"] = False
+
+        try:
+            ga = json.loads(
+                (tdp / "v2" / "ItemGuardianApprovalReviewCompletedNotification.json").read_text(encoding="utf-8")
+            )
+            field_checks["guardianReview.review"] = "review" in (ga.get("properties") or {})
+        except Exception:
+            field_checks["guardianReview.schema"] = False
+
+        ok = not (missing_client or missing_notif or missing_sreq) and all(field_checks.values())
+        return {
+            "ok": ok,
+            "missingClientMethods": missing_client,
+            "missingNotifications": missing_notif,
+            "missingServerRequests": missing_sreq,
+            "fieldChecks": field_checks,
+        }
+
+
+def cmd_doctor(args: argparse.Namespace) -> None:
+    report: Dict[str, Any] = {"ok": True, "local": {}, "remotes": {}, "schema": {}}
+    raw_hosts = args.hosts or os.environ.get("DECODEX_DOCTOR_HOSTS", "local")
+    hosts = [h.strip() for h in raw_hosts.split(",") if h.strip()]
+
+    bundled_ver = None
+    if BUNDLED_MAC_CODEX.is_file():
+        p = subprocess.run([str(BUNDLED_MAC_CODEX), "--version"], capture_output=True, text=True, timeout=10)
+        if p.returncode == 0:
+            bundled_ver = p.stdout.strip().split()[-1]
+
+    local_bin = find_local_codex_bin()
+    daemon_info: Dict[str, Any] = {}
+    p = subprocess.run([local_bin, "app-server", "daemon", "version"], capture_output=True, text=True, timeout=10)
+    if p.returncode == 0:
+        try:
+            daemon_info = json.loads(p.stdout.strip())
+        except Exception:
+            daemon_info = {"raw": p.stdout.strip()}
+    else:
+        daemon_info = {"status": "stopped_or_unreachable", "error": (p.stderr or p.stdout).strip()}
+
+    daemon_ver = daemon_info.get("appServerVersion") or daemon_info.get("managedCodexVersion")
+    version_mismatch = bool(bundled_ver and daemon_ver and bundled_ver != daemon_ver)
+
+    if args.fix and (version_mismatch or daemon_info.get("status") != "running"):
+        target_bin = str(BUNDLED_MAC_CODEX) if BUNDLED_MAC_CODEX.is_file() else local_bin
+        fix_cmd = (
+            [target_bin, "app-server", "daemon", "update", "--from-cli", "--yes"]
+            if version_mismatch
+            else [target_bin, "app-server", "daemon", "start"]
+        )
+        rp = subprocess.run(fix_cmd, capture_output=True, text=True, timeout=30)
+        report["local"]["fixOutput"] = (rp.stdout or rp.stderr).strip()
+        p2 = subprocess.run([target_bin, "app-server", "daemon", "version"], capture_output=True, text=True, timeout=10)
+        if p2.returncode == 0:
+            try:
+                daemon_info = json.loads(p2.stdout.strip())
+                daemon_ver = daemon_info.get("appServerVersion")
+                version_mismatch = bool(bundled_ver and daemon_ver and bundled_ver != daemon_ver)
+            except Exception:
+                pass
+
+    report["local"].update(
+        {
+            "bundledAppCliVersion": bundled_ver,
+            "activeDaemonVersion": daemon_ver,
+            "daemonStatus": daemon_info.get("status"),
+            "versionMismatch": version_mismatch,
+            "fixHint": "decodex doctor --fix" if version_mismatch else None,
+        }
+    )
+    if daemon_info.get("status") != "running" or version_mismatch:
+        report["ok"] = False
+
+    schema_bin = str(BUNDLED_MAC_CODEX) if BUNDLED_MAC_CODEX.is_file() else local_bin
+    schema_res = _check_local_schema(schema_bin)
+    report["schema"] = schema_res
+    if not schema_res.get("ok"):
+        report["ok"] = False
+
+    for h in hosts:
+        if h == "local":
+            continue
+        rcmd = f"{REMOTE_PATH_SETUP}; codex app-server daemon version"
+        try:
+            rp = subprocess.run(
+                ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", h, rcmd],
+                capture_output=True,
+                text=True,
+                timeout=12,
+            )
+            if rp.returncode == 0:
+                info = json.loads(rp.stdout.strip())
+                cli_v = info.get("cliVersion")
+                srv_v = info.get("appServerVersion")
+                mm = bool(cli_v and srv_v and cli_v != srv_v)
+                report["remotes"][h] = {
+                    "ok": info.get("status") == "running" and not mm,
+                    "status": info.get("status"),
+                    "cliVersion": cli_v,
+                    "appServerVersion": srv_v,
+                    "versionMismatch": mm,
+                    "fixHint": f"ssh {h} 'codex app-server daemon update --from-cli --yes'" if mm else None,
+                }
+                if not report["remotes"][h]["ok"]:
+                    report["ok"] = False
+            else:
+                report["remotes"][h] = {"ok": False, "error": (rp.stderr or rp.stdout).strip()}
+                report["ok"] = False
+        except Exception as e:
+            report["remotes"][h] = {"ok": False, "error": str(e)}
+            report["ok"] = False
+
+    emit_json(report)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="decodex", description="DeCodex: Agent <-> Codex app-server bridge")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("projects", help="List/search existing local & remote Codex App projects")
+    sp.add_argument("--host", default="all", help="Filter by host (all, local, <ssh-host>, ...)")
+    sp.add_argument("--query", default=None, help="Case-insensitive substring filter")
+    sp.set_defaults(func=cmd_projects)
+
+    sp = sub.add_parser("start", help="Create a prefixed thread in an existing project and start turn")
+    sp.add_argument("--host", required=True, help="Target host: local or any SSH alias configured for Codex")
+    sp.add_argument("--dir", default=None, help="Exact project directory path on target host")
+    sp.add_argument("--project", default=None, help="Project name/query from `decodex projects`")
+    sp.add_argument("--title", default=None, help="Short thread title (auto-prefixed with DECODEX_TITLE_PREFIX, default ✦)")
+    sp.add_argument("--prompt", default=None, help="Prompt text")
+    sp.add_argument("--prompt-file", default=None, help="Read prompt text from file (or - for stdin)")
+    sp.add_argument("--model", default=None, help="Optional model override")
+    sp.add_argument("--effort", default=None, help="Optional reasoning effort override")
+    sp.add_argument("--sandbox", default=None, choices=["read-only", "workspace-write", "danger-full-access"])
+    sp.add_argument("--approval-policy", default="on-request", choices=["on-request", "never", "untrusted"])
+    sp.add_argument("--approvals-reviewer", default="auto_review", choices=["auto_review", "user", "guardian_subagent"])
+    sp.add_argument("--watch", dest="watch", action="store_true", default=True, help="Block silently until wake event (default)")
+    sp.add_argument("--no-watch", dest="watch", action="store_false", help="Return immediately after starting turn")
+    sp.add_argument("--timeout", type=float, default=0.0, help="Optional watch timeout in seconds (0 = infinite)")
+    sp.set_defaults(func=cmd_start)
+
+    sp = sub.add_parser("watch", help="Silently wait for next wake event on an existing thread")
+    sp.add_argument("--host", required=True)
+    sp.add_argument("--thread", required=True, help="Thread UUID")
+    sp.add_argument("--from-item", default=None, help="Cursor item ID already reported")
+    sp.add_argument("--timeout", type=float, default=0.0)
+    sp.set_defaults(func=cmd_watch)
+
+    sp = sub.add_parser("steer", help="Inject mid-turn guidance (turn/steer, falls back to turn/start)")
+    sp.add_argument("--host", required=True)
+    sp.add_argument("--thread", required=True)
+    sp.add_argument("--prompt", default=None)
+    sp.add_argument("--prompt-file", default=None)
+    sp.add_argument("--watch", dest="watch", action="store_true", default=True)
+    sp.add_argument("--no-watch", dest="watch", action="store_false")
+    sp.add_argument("--timeout", type=float, default=0.0)
+    sp.set_defaults(func=cmd_steer)
+
+    sp = sub.add_parser("queue", help="Queue follow-up message for after current turn ends")
+    sp.add_argument("--host", required=True)
+    sp.add_argument("--thread", required=True)
+    sp.add_argument("--prompt", default=None)
+    sp.add_argument("--prompt-file", default=None)
+    sp.set_defaults(func=cmd_queue)
+
+    sp = sub.add_parser("approve", help="Approve pending Guardian-denied action and continue")
+    sp.add_argument("--host", required=True)
+    sp.add_argument("--thread", required=True)
+    sp.add_argument("--event-file", default=None)
+    sp.add_argument("--prompt", default=None, help="Optional custom follow-up instruction after approval")
+    sp.add_argument("--no-continue", action="store_true", help="Only register Guardian approval without sending follow-up turn")
+    sp.add_argument("--watch", dest="watch", action="store_true", default=True)
+    sp.add_argument("--no-watch", dest="watch", action="store_false")
+    sp.add_argument("--timeout", type=float, default=0.0)
+    sp.set_defaults(func=cmd_approve)
+
+    sp = sub.add_parser("interrupt", help="Interrupt an active turn")
+    sp.add_argument("--host", required=True)
+    sp.add_argument("--thread", required=True)
+    sp.add_argument("--turn", default=None)
+    sp.set_defaults(func=cmd_interrupt)
+
+    sp = sub.add_parser("status", help="Read compact thread & latest turn status")
+    sp.add_argument("--host", required=True)
+    sp.add_argument("--thread", required=True)
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("inspect", help="Inspect saved full message or recent thread items")
+    sp.add_argument("--host", default="local")
+    sp.add_argument("--thread", required=True)
+    sp.add_argument("--saved", action="store_true", help="Print locally cached full last_message.md")
+    sp.add_argument("--limit", type=int, default=10, help="Number of recent items to fetch")
+    sp.set_defaults(func=cmd_inspect)
+
+    sp = sub.add_parser("doctor", help="Check local/remote daemon versions and app-server RPC schema compatibility")
+    sp.add_argument("--hosts", default=None, help="Comma-separated hosts to check (default: DECODEX_DOCTOR_HOSTS or local)")
+    sp.add_argument("--fix", action="store_true", help="Auto-update/start local daemon to match bundled CLI")
+    sp.set_defaults(func=cmd_doctor)
+
+    return p
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        args.func(args)
+        return 0
+    except DeCodexError as e:
+        emit_json({"event": "ERROR", "error": str(e)})
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
