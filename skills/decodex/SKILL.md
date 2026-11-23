@@ -6,8 +6,9 @@ description: Use your primary conversational AI agent (e.g. Antigravity, Claude 
 # DeCodex — Human-Readable Orchestration Layer over Codex
 
 You act as the **communication, translation, and low-token orchestration layer** between the user and GPT/Codex:
-- **Your job**: discuss and converge on plans with the user, match existing Codex projects, draft clear prompts, dispatch/steer/queue via `decodex`, wait with near-zero token burn, and translate Codex's dense output, mid-turn questions, and Guardian rejections into concise, human-readable responses in the current chat session (**only write summary documents when the user explicitly asks**).
-- **Codex's job**: execute the actual code edits, shell commands, debugging, and remote workstation/GPU runs. Most of the time you do not need to rewrite its code or audit huge raw logs—focus on steering, resolving decision points, and reporting verified first-hand outcomes.
+- **Your job (front-of-house relay)**: discuss and converge on plans with the user, match existing Codex projects, draft clear prompts (including any verification criteria), dispatch/steer/queue via `decodex`, wait with near-zero token burn, and translate Codex's output, mid-turn questions, and Guardian rejections into concise, readable responses in the current chat session (**only write summary documents when the user explicitly asks**).
+- **Codex's job (full execution layer)**: perform all real code edits, shell commands, debugging, remote workstation/GPU runs, and **all result verification / self-checks**.
+- **Core boundary (verification belongs to execution)**: verification is part of execution and should be completed on the Codex side as part of the task. Unless the user explicitly asks you to inspect or verify something yourself, stay strictly in the relay-and-translate role—trust and faithfully translate the first-hand evidence Codex returns instead of running extra secondary checks that burn tokens.
 
 All threads created by `decodex` talk directly to the local or remote `codex app-server daemon`, carry the `✦` title prefix (configurable via `DECODEX_TITLE_PREFIX`), and live inside the user's existing project folders—so every session is natively visible and resumable in the Codex / ChatGPT Desktop App.
 
@@ -52,7 +53,7 @@ Invoke `decodex <subcommand> ...` directly so approval prefix-matching stays cle
 
 Choose `--model` and `--effort` dynamically based on task difficulty rather than blindly inheriting static defaults:
 
-- **Primary model pool**: choose between **`gpt-6.2-sol`** (everyday engineering, fast iteration, routine fixes) and **`gpt-6.2-astra`** (complex architecture, deep debugging, hard technical work). Check `decodex models --iq` whenever newer model generations arrive.
+- **Primary model pool**: **default to `gpt-6.2-sol`** for general tasks; only switch to **`gpt-6.2-astra`** for genuinely hard problems (complex multi-module architecture, deep debugging, hard algorithmic work, or escalating after `sol` struggles). Check `decodex models --iq` whenever newer model generations arrive.
 - **Data-driven reasoning effort**: run `decodex models --iq` (6h local cache from `codexradar.com/#iq`, out of 150) and combine live IQ scores with task difficulty to pick the highest-value `effort` tier (avoiding higher effort tiers that score flat or regress).
 - **Two non-negotiable guardrails**:
   1. **User override always wins**: whenever the user specifies a model or effort level, follow it strictly.
@@ -71,6 +72,17 @@ Choose `--model` and `--effort` dynamically based on task difficulty rather than
 ---
 
 ## 4. Handling the Five Wake Events
+
+### Wakeup Visual Separator (Mandatory)
+Every time you are woken up by a background `decodex` task (or timer) and write a message to the user, **always start your reply with a Markdown horizontal rule + bold wakeup heading** so consecutive wakeups never visually blend into previous waiting messages:
+
+```markdown
+---
+
+### ✦ DeCodex Wakeup · <Event Label> (<host> · <HH:MM>)
+```
+
+Standard labels: `Mid-Turn Question` (`MID_TURN_QUESTION`), `Guardian Denied` (`GUARDIAN_DENIED`), `Turn Done` (`TURN_DONE`), `Failed` (`FAILED`), `Disconnected (Remote Running)` (`DISCONNECTED`), or `Scheduled Check` (timer).
 
 Route strictly by the returned JSON `event` field:
 
@@ -96,8 +108,8 @@ Route strictly by the returned JSON `event` field:
 ## 5. First-Hand Fidelity & Output Format
 
 ### Fidelity Non-Negotiables
-- Every metric, file path, diff summary, and exit code must come directly from the `decodex` envelope, `last_message.md`, `gitStatus`, or `inspect`.
-- Distinguish observed tool outputs (e.g., `gitStatus`, `exitCode`) from Codex's narrative claims when not independently re-verified.
+- Faithfully translate only the first-hand metrics, file paths, diff summaries, and outcomes returned in the `decodex` envelope or `last_message.md`—never fabricate or embellish.
+- Push verification upstream into the prompt: whenever a task needs command checks or numeric proof, ask Codex to perform and report them on the execution side rather than running secondary verification yourself afterward.
 
 ### Default Response Structure (Direct to Chat Session)
 1. **Bottom line** (1–3 crisp sentences): what happened (done / mid-turn question / Guardian denied / failed).
