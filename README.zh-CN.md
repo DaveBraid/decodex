@@ -25,6 +25,7 @@ GPT / Codex 非常适合承担真正繁重的工程与实验执行（改代码�
   - `decodex steer`：运行中不中断实时引导（`turn/steer`；若当前回合恰好已结束则自动降级为 `turn/start`）。
   - `decodex queue`：原生排队下一回合任务（`codex queue`）。
   - `decodex approve`：原生放行 Guardian 驳回动作（`thread/approveGuardianDeniedAction`）并自动衔接执行。
+- **按智商得分自主选型（`decodex models --iq`）**：读取本地 `models_cache.json` 可用模型，并可选挂载 [CodexRadar](https://codexradar.com/#iq) 最新各档位智商得分（6 小时本地缓存），让总控 Agent 按任务难度自主挑选 `--model` / `--effort`，并支持在 `decodex steer` 续聊时随时升/降档。
 - **内置升级自检**：`decodex doctor` 一键检查本地/远端 daemon 版本对齐情况，并对照 `codex app-server generate-json-schema` 校验全部关键 RPC 与字段契约。
 
 ## 架构概览
@@ -73,18 +74,21 @@ cp -r skills/decodex ~/.gemini/config/skills/decodex
 ## 常用命令
 
 ```bash
-# 1. 查看并搜索本地与远端已有 Codex App 项目
+# 1. 查看本地与远端已有 Codex App 项目及可用模型/智商得分
 decodex projects
 decodex projects --host my-gpu-box --query training
+decodex models --iq
 
 # 2. 在已有项目中发起新任务并静默等待事件唤醒
 decodex start \
   --host my-gpu-box \
   --project training \
+  --model gpt-6.2-sol \
+  --effort xhigh \
   --title "跑消融实验基线" \
   --prompt-file /tmp/plan.md
 
-# 3. 工作时不中断实时引导（纠偏 / 补充条件 / 回答运行中提问）
+# 3. 工作时不中断实时引导（新回合可顺带切 --model / --effort）
 decodex steer --host my-gpu-box --thread <thread-id> --prompt "学习率改成 3e-4"
 
 # 4. 工作时排队下一回合衔接任务

@@ -47,6 +47,11 @@ DECODEX_HOME = Path(os.environ.get("DECODEX_HOME", str(Path.home() / ".decodex")
 LOCAL_SOCK = CODEX_HOME / "app-server-control" / "app-server-control.sock"
 GLOBAL_STATE = CODEX_HOME / ".codex-global-state.json"
 LOCAL_SQLITE = CODEX_HOME / "state_5.sqlite"
+MODELS_CACHE = CODEX_HOME / "models_cache.json"
+CONFIG_TOML = CODEX_HOME / "config.toml"
+IQ_CACHE = DECODEX_HOME / "codexradar_iq_cache.json"
+CODEXRADAR_IQ_URL = "https://codexradar.com/data/intelligence-trends.json"
+IQ_CACHE_TTL_SEC = 6 * 3600
 TITLE_PREFIX = os.environ.get("DECODEX_TITLE_PREFIX", "✦")
 
 BUNDLED_MAC_CODEX = Path(
@@ -928,6 +933,141 @@ def cmd_projects(args: argparse.Namespace) -> None:
     emit_json({"count": len(items), "projects": items})
 
 
+def _read_config_defaults() -> Dict[str, Optional[str]]:
+    defaults: Dict[str, Optional[str]] = {"model": None, "effort": None}
+    if not CONFIG_TOML.is_file():
+        return defaults
+    try:
+        import tomllib
+
+        cfg = tomllib.loads(CONFIG_TOML.read_text(encoding="utf-8"))
+        defaults["model"] = cfg.get("model")
+        defaults["effort"] = cfg.get("model_reasoning_effort")
+    except Exception:
+        pass
+    return defaults
+
+
+def _fetch_codexradar_iq(refresh: bool = False) -> Dict[str, Any]:
+    now = time.time()
+    cached: Optional[Dict[str, Any]] = None
+    if IQ_CACHE.is_file():
+        try:
+            cached = json.loads(IQ_CACHE.read_text(encoding="utf-8"))
+            if not refresh and now - float(cached.get("fetchedAt", 0)) < IQ_CACHE_TTL_SEC:
+                out = dict(cached)
+                out["cacheHit"] = True
+                return out
+        except Exception:
+            cached = None
+
+    try:
+        proc = subprocess.run(
+            ["curl", "-sL", "--max-time", "15", CODEXRADAR_IQ_URL],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            raise RuntimeError(proc.stderr.strip() or f"curl exited {proc.returncode}")
+        raw = json.loads(proc.stdout)
+        batches = raw.get("batches") or []
+        if not batches:
+            raise RuntimeError("No batches found in intelligence-trends.json")
+        latest = batches[-1]
+        score_max = latest.get("score_max") or raw.get("score_max") or 150
+        by_model: Dict[str, Dict[str, Any]] = {}
+        for pt in latest.get("points") or []:
+            m = pt.get("model")
+            eff = pt.get("effort")
+            sc = pt.get("score")
+            if not m or not eff or sc is None:
+                continue
+            by_model.setdefault(m, {})[eff] = round(float(sc), 2)
+        parsed = {
+            "source": CODEXRADAR_IQ_URL,
+            "roundId": latest.get("id"),
+            "label": latest.get("label"),
+            "completedAt": latest.get("completed_at"),
+            "scoreMax": score_max,
+            "fetchedAt": int(now),
+            "cacheHit": False,
+            "scores": by_model,
+        }
+        DECODEX_HOME.mkdir(parents=True, exist_ok=True)
+        save_json(IQ_CACHE, parsed)
+        return parsed
+    except Exception as e:
+        if cached:
+            out = dict(cached)
+            out["cacheHit"] = True
+            out["staleFallback"] = True
+            out["fetchError"] = str(e)
+            return out
+        return {"source": CODEXRADAR_IQ_URL, "error": str(e), "scores": {}}
+
+
+def cmd_models(args: argparse.Namespace) -> None:
+    defaults = _read_config_defaults()
+    raw_models: List[Dict[str, Any]] = []
+    if MODELS_CACHE.is_file():
+        try:
+            mc = json.loads(MODELS_CACHE.read_text(encoding="utf-8"))
+            raw_models = mc.get("models") if isinstance(mc, dict) else (mc if isinstance(mc, list) else [])
+        except Exception as e:
+            raise DeCodexError(f"Failed to read {MODELS_CACHE}: {e}") from e
+
+    iq_bundle: Optional[Dict[str, Any]] = None
+    if args.iq:
+        iq_bundle = _fetch_codexradar_iq(refresh=args.refresh)
+    iq_scores = (iq_bundle or {}).get("scores") or {}
+
+    q = (args.query or "").lower()
+    items: List[Dict[str, Any]] = []
+    for m in raw_models:
+        if not isinstance(m, dict):
+            continue
+        vis = m.get("visibility")
+        if not args.all and vis != "list":
+            continue
+        slug = m.get("slug") or m.get("id") or ""
+        desc = m.get("description") or ""
+        if q and q not in slug.lower() and q not in desc.lower():
+            continue
+        efforts = [
+            e.get("effort") if isinstance(e, dict) else e
+            for e in (m.get("supported_reasoning_levels") or [])
+        ]
+        entry: Dict[str, Any] = {
+            "slug": slug,
+            "visibility": vis,
+            "defaultEffort": m.get("default_reasoning_level"),
+            "supportedEfforts": efforts,
+            "description": desc,
+        }
+        if args.iq and slug in iq_scores:
+            entry["iq"] = iq_scores[slug]
+        items.append(entry)
+
+    out: Dict[str, Any] = {
+        "defaults": defaults,
+        "count": len(items),
+        "models": items,
+    }
+    if iq_bundle is not None:
+        out["iqMeta"] = {
+            "source": iq_bundle.get("source"),
+            "roundId": iq_bundle.get("roundId"),
+            "label": iq_bundle.get("label"),
+            "completedAt": iq_bundle.get("completedAt"),
+            "scoreMax": iq_bundle.get("scoreMax"),
+            "cacheHit": iq_bundle.get("cacheHit"),
+            "staleFallback": iq_bundle.get("staleFallback", False),
+            "error": iq_bundle.get("error") or iq_bundle.get("fetchError"),
+        }
+    emit_json(out)
+
+
 def cmd_start(args: argparse.Namespace) -> None:
     cwd, proj_name = resolve_project_dir(args.host, args.dir, args.project)
     prompt = read_prompt_arg(args.prompt, args.prompt_file)
@@ -974,6 +1114,8 @@ def cmd_start(args: argparse.Namespace) -> None:
         turn_res = client.request("turn/start", turn_params)
         turn = turn_res.get("turn") or {}
         turn_id = turn.get("id")
+        resolved_model = args.model or res.get("model") or thread.get("model")
+        resolved_effort = args.effort or res.get("reasoningEffort")
 
         save_json(
             thread_cache_dir(thread_id) / "meta.json",
@@ -983,6 +1125,8 @@ def cmd_start(args: argparse.Namespace) -> None:
                 "cwd": cwd,
                 "projectName": proj_name,
                 "title": title,
+                "model": resolved_model,
+                "effort": resolved_effort,
                 "createdAt": int(time.time()),
             },
         )
@@ -996,6 +1140,8 @@ def cmd_start(args: argparse.Namespace) -> None:
                     "turnId": turn_id,
                     "cwd": cwd,
                     "title": title,
+                    "model": resolved_model,
+                    "effort": resolved_effort,
                 }
             )
             return
@@ -1009,6 +1155,8 @@ def cmd_start(args: argparse.Namespace) -> None:
             timeout=args.timeout,
             already_subscribed=True,
         )
+        env["model"] = resolved_model
+        env["effort"] = resolved_effort
         emit_json(env)
     finally:
         client.close()
@@ -1047,6 +1195,15 @@ def cmd_steer(args: argparse.Namespace) -> None:
 
         mode_used = "turn/start"
         turn_id = active_turn_id
+        turn_start_params: Dict[str, Any] = {
+            "threadId": args.thread,
+            "input": [{"type": "text", "text": prompt}],
+        }
+        if args.model:
+            turn_start_params["model"] = args.model
+        if args.effort:
+            turn_start_params["effort"] = args.effort
+        model_note = None
 
         if active_turn_id:
             try:
@@ -1060,39 +1217,35 @@ def cmd_steer(args: argparse.Namespace) -> None:
                 )
                 turn_id = steer_res.get("turnId") or active_turn_id
                 mode_used = "turn/steer"
+                if args.model or args.effort:
+                    model_note = "mid-turn steer keeps active turn's model/effort; override applies on next turn/start"
             except DeCodexError:
-                turn_res = client.request(
-                    "turn/start",
-                    {
-                        "threadId": args.thread,
-                        "input": [{"type": "text", "text": prompt}],
-                    },
-                )
+                turn_res = client.request("turn/start", turn_start_params)
                 turn_id = (turn_res.get("turn") or {}).get("id")
                 mode_used = "turn/start(fallback)"
         else:
-            turn_res = client.request(
-                "turn/start",
-                {
-                    "threadId": args.thread,
-                    "input": [{"type": "text", "text": prompt}],
-                },
-            )
+            turn_res = client.request("turn/start", turn_start_params)
             turn_id = (turn_res.get("turn") or {}).get("id")
             mode_used = "turn/start"
 
+        resolved_model = args.model or resumed.get("model") or thread_obj.get("model")
+        resolved_effort = args.effort or resumed.get("reasoningEffort")
+
         if not args.watch:
-            emit_json(
-                {
-                    "event": "STEERED",
-                    "mode": mode_used,
-                    "host": args.host,
-                    "threadId": args.thread,
-                    "turnId": turn_id,
-                    "cwd": cwd,
-                    "title": title,
-                }
-            )
+            out_steered: Dict[str, Any] = {
+                "event": "STEERED",
+                "mode": mode_used,
+                "host": args.host,
+                "threadId": args.thread,
+                "turnId": turn_id,
+                "cwd": cwd,
+                "title": title,
+                "model": resolved_model,
+                "effort": resolved_effort,
+            }
+            if model_note:
+                out_steered["modelNote"] = model_note
+            emit_json(out_steered)
             return
 
         env = watch_thread(
@@ -1106,6 +1259,10 @@ def cmd_steer(args: argparse.Namespace) -> None:
             already_subscribed=True,
         )
         env["steerMode"] = mode_used
+        env["model"] = resolved_model
+        env["effort"] = resolved_effort
+        if model_note:
+            env["modelNote"] = model_note
         emit_json(env)
     finally:
         client.close()
@@ -1567,6 +1724,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--query", default=None, help="Case-insensitive substring filter")
     sp.set_defaults(func=cmd_projects)
 
+    sp = sub.add_parser("models", help="List available Codex models, reasoning efforts, and optional CodexRadar IQ scores")
+    sp.add_argument("--query", default=None, help="Case-insensitive filter on slug or description")
+    sp.add_argument("--all", action="store_true", help="Include hidden models from models_cache.json")
+    sp.add_argument("--iq", action="store_true", help="Attach CodexRadar IQ scores (cached 6h in ~/.decodex)")
+    sp.add_argument("--refresh", action="store_true", help="Bypass 6h cache and re-fetch CodexRadar IQ data")
+    sp.set_defaults(func=cmd_models)
+
     sp = sub.add_parser("start", help="Create a prefixed thread in an existing project and start turn")
     sp.add_argument("--host", required=True, help="Target host: local or any SSH alias configured for Codex")
     sp.add_argument("--dir", default=None, help="Exact project directory path on target host")
@@ -1596,6 +1760,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--thread", required=True)
     sp.add_argument("--prompt", default=None)
     sp.add_argument("--prompt-file", default=None)
+    sp.add_argument("--model", default=None, help="Optional model override (applies when starting a new turn)")
+    sp.add_argument("--effort", default=None, help="Optional reasoning effort override (applies when starting a new turn)")
     sp.add_argument("--watch", dest="watch", action="store_true", default=True)
     sp.add_argument("--no-watch", dest="watch", action="store_false")
     sp.add_argument("--timeout", type=float, default=0.0)

@@ -34,16 +34,29 @@ Invoke `decodex <subcommand> ...` directly so approval prefix-matching stays cle
 | Task | Command | Notes |
 | :--- | :--- | :--- |
 | List/search existing projects | `decodex projects --host all --query <kw>` | Reads local Codex state only; no network required |
-| Start a task & wait silently | `decodex start --host <host> --project <name> --title "<short>" --prompt-file /tmp/p.md` | Creates a `✦` thread with Guardian auto-review (`auto_review`) and blocks silently until a wake event |
+| List models & CodexRadar IQ | `decodex models --iq [--query <kw>] [--refresh]` | Reads local `models_cache.json` and attaches `codexradar.com/#iq` scores (6h local cache) |
+| Start a task & wait silently | `decodex start --host <host> --project <name> --model <m> --effort <e> --title "<short>" --prompt-file /tmp/p.md` | Creates a `✦` thread with Guardian auto-review (`auto_review`) and blocks silently until a wake event |
 | Fire-and-forget start | `decodex start ... --no-watch` | Returns `threadId` / `turnId` immediately |
 | Re-attach / resume watching | `decodex watch --host <host> --thread <tid> --from-item <item_id>` | Catches up on offline items/completions without polling |
-| **Mid-turn live guidance** | `decodex steer --host <host> --thread <tid> --prompt-file /tmp/s.md` | Uses native `turn/steer` without interrupting active work (auto-falls back to `turn/start` if the turn ended). Pass `--no-watch` if another `watch` task is already running |
+| **Mid-turn live guidance** | `decodex steer --host <host> --thread <tid> [--model <m> --effort <e>] --prompt-file /tmp/s.md` | Uses native `turn/steer` without interrupting active work (auto-falls back to `turn/start`, where `--model`/`--effort` overrides apply). Pass `--no-watch` if another `watch` task is already running |
 | **Queue next-turn task** | `decodex queue --host <host> --thread <tid> --prompt-file /tmp/q.md` | Uses native `codex queue`; runs automatically after the current turn finishes |
 | Approve Guardian denial | `decodex approve --host <host> --thread <tid>` | Only after explicit user confirmation; calls `thread/approveGuardianDeniedAction` and automatically continues |
 | Interrupt active turn | `decodex interrupt --host <host> --thread <tid>` | Calls `turn/interrupt` |
 | Compact status snapshot | `decodex status --host <host> --thread <tid>` | Returns `< 2 KB` envelope + `fullMessagePath` |
 | Inspect details on demand | `decodex inspect --host <host> --thread <tid> --saved` or `--limit 10` | Only when `messageTruncated: true` or debugging failures |
 | Version & schema health check | `decodex doctor --hosts local,<remote>` (add `--fix` for local) | Run after Codex updates to align daemon versions and verify RPC schema compatibility |
+
+---
+
+## 2.5 Autonomous Model & Reasoning Effort Selection
+
+Choose `--model` and `--effort` dynamically based on task difficulty rather than blindly inheriting static defaults:
+
+- **Primary model pool**: choose between **`gpt-6.2-sol`** (everyday engineering, fast iteration, routine fixes) and **`gpt-6.2-astra`** (complex architecture, deep debugging, hard technical work). Check `decodex models --iq` whenever newer model generations arrive.
+- **Data-driven reasoning effort**: run `decodex models --iq` (6h local cache from `codexradar.com/#iq`, out of 150) and combine live IQ scores with task difficulty to pick the highest-value `effort` tier (avoiding higher effort tiers that score flat or regress).
+- **Two non-negotiable guardrails**:
+  1. **User override always wins**: whenever the user specifies a model or effort level, follow it strictly.
+  2. **Transparent reporting**: always include the actual `model / effort` (from `decodex`'s returned JSON) in your status/completion summary so the user can upgrade or downgrade anytime via `decodex steer --model ... --effort ...`.
 
 ---
 

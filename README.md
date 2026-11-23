@@ -25,6 +25,7 @@ Codex is great at grinding through real engineering work—editing repos, runnin
   - `decodex steer` — Real-time non-interrupting guidance (`turn/steer`, auto-falls back to `turn/start` if the turn just completed).
   - `decodex queue` — Native next-turn queueing (`codex queue`).
   - `decodex approve` — Native Guardian denial override (`thread/approveGuardianDeniedAction`) + automatic continuation.
+- **Autonomous model & effort selection (`decodex models --iq`)**: Reads available local models from `models_cache.json` and optionally attaches live [CodexRadar IQ scores](https://codexradar.com/#iq) (with a 6-hour local cache), letting your orchestrator pick the optimal `--model` and `--effort` per task and override them on follow-up turns via `decodex steer --model ... --effort ...`.
 - **Upgrade-proof self-check**: `decodex doctor` verifies local/remote daemon version alignment and checks live RPC contract compatibility against `codex app-server generate-json-schema`.
 
 ## Architecture
@@ -74,18 +75,21 @@ cp -r skills/decodex ~/.gemini/config/skills/decodex
 ## Usage
 
 ```bash
-# 1. Discover existing local & remote Codex App projects
+# 1. Discover existing local & remote Codex App projects & available models
 decodex projects
 decodex projects --host my-gpu-box --query training
+decodex models --iq
 
 # 2. Start a task in an existing project and wait silently for events
 decodex start \
   --host my-gpu-box \
   --project training \
+  --model gpt-6.2-sol \
+  --effort xhigh \
   --title "Run ablation baseline" \
   --prompt-file /tmp/plan.md
 
-# 3. Inject mid-turn guidance without interrupting active work
+# 3. Inject mid-turn guidance without interrupting active work (or switch model/effort on next turn)
 decodex steer --host my-gpu-box --thread <thread-id> --prompt "Switch lr to 3e-4"
 
 # 4. Queue a follow-up task for after the current turn finishes
