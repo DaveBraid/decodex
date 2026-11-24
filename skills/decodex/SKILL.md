@@ -30,17 +30,18 @@ decodex projects --host all --query <keyword>
 
 ## 2. Command Reference (`decodex`)
 
-Invoke `decodex <subcommand> ...` directly so approval prefix-matching stays clean. For long prompts, write to a temp file and pass `--prompt-file` to avoid shell quoting issues.
+Invoke `decodex <subcommand> ...` directly so approval prefix-matching stays clean. **Do not create temporary `.md` files just to pass prompts**: use `--prompt '...'` for short instructions, or a single-quoted stdin heredoc (`decodex start ... --prompt-file - <<'EOF' ... EOF`) for multi-line prompts or prompts containing quotes/backticks/`$`. Only pass `--prompt-file <path>` when reusing an existing file.
 
 | Task | Command | Notes |
 | :--- | :--- | :--- |
 | List/search existing projects | `decodex projects --host all --query <kw>` | Reads local Codex state only; no network required |
 | List models & CodexRadar IQ | `decodex models --iq [--query <kw>] [--refresh]` | Reads local `models_cache.json` and attaches `codexradar.com/#iq` scores (6h local cache) |
-| Start a task & wait silently | `decodex start --host <host> --project <name> --model <m> --effort <e> --title "<short>" --prompt-file /tmp/p.md` | Creates a `✦` thread with Guardian auto-review (`auto_review`) and blocks silently until a wake event |
+| Start a task & wait silently | `decodex start --host <host> --project <name> --model <m> --effort <e> --title "<short>" --prompt-file - <<'EOF'` | Creates a `✦` thread with Guardian auto-review (`auto_review`) and blocks silently until a wake event (or `--prompt '...'` for short tasks) |
 | Fire-and-forget start | `decodex start ... --no-watch` | Returns `threadId` / `turnId` immediately |
 | Re-attach / resume watching | `decodex watch --host <host> --thread <tid> --from-item <item_id>` | Catches up on offline items/completions without polling |
-| **Mid-turn live guidance** | `decodex steer --host <host> --thread <tid> [--model <m> --effort <e>] --prompt-file /tmp/s.md` | Uses native `turn/steer` without interrupting active work (auto-falls back to `turn/start`, where `--model`/`--effort` overrides apply). Pass `--no-watch` if another `watch` task is already running |
-| **Queue next-turn task** | `decodex queue --host <host> --thread <tid> --prompt-file /tmp/q.md` | Uses native `codex queue`; runs automatically after the current turn finishes |
+| **Mid-turn live guidance** | `decodex steer --host <host> --thread <tid> [--model <m> --effort <e>] --prompt '...'` | Uses native `turn/steer` without interrupting active work (auto-falls back to `turn/start`, where `--model`/`--effort` overrides apply). Pass `--no-watch` if another `watch` task is already running; use `--prompt-file - <<'EOF'` for long text |
+| **Change Fast while working** | `decodex fast --host <host> --thread <tid> --on` or `--off` | Updates the thread default. The current turn continues and no prompt is sent. |
+| **Queue next-turn task** | `decodex queue --host <host> --thread <tid> --prompt '...'` | Uses native `codex queue`; runs automatically after the current turn finishes |
 | Approve Guardian denial | `decodex approve --host <host> --thread <tid>` | Only after explicit user confirmation; calls `thread/approveGuardianDeniedAction` and automatically continues |
 | Interrupt active turn | `decodex interrupt --host <host> --thread <tid>` | Calls `turn/interrupt` |
 | Compact status snapshot | `decodex status --host <host> --thread <tid>` | Returns `< 2 KB` envelope + `fullMessagePath` |
@@ -49,7 +50,7 @@ Invoke `decodex <subcommand> ...` directly so approval prefix-matching stays cle
 
 ---
 
-## 2.5 Autonomous Model & Reasoning Effort Selection
+## 2.5 Autonomous Model, Reasoning Effort & Fast Selection
 
 Choose `--model` and `--effort` dynamically based on task difficulty rather than blindly inheriting static defaults:
 
@@ -58,6 +59,8 @@ Choose `--model` and `--effort` dynamically based on task difficulty rather than
 - **Two non-negotiable guardrails**:
   1. **User override always wins**: whenever the user specifies a model or effort level, follow it strictly.
   2. **Transparent reporting**: always include the actual `model / effort` (from `decodex`'s returned JSON) in your status/completion summary so the user can upgrade or downgrade anytime via `decodex steer --model ... --effort ...`.
+
+Leave Fast off by default to conserve quota. Use it only on explicit user request or for an especially urgent task. With `start` or `steer`, choose `--fast` for the thread or `--fast-once` for a single new turn. Use the latter with `steer` when the thread is idle. Use `decodex fast --on/--off` to change the thread default without sending input. Check the returned `serviceTier` (`priority` for Fast, `default` for standard) and `turnServiceTier` when present.
 
 ---
 
@@ -114,7 +117,7 @@ Route strictly by the returned JSON `event` field:
 ### Default Response Structure (Direct to Chat Session)
 1. **Bottom line** (1–3 crisp sentences): what happened (done / mid-turn question / Guardian denied / failed).
 2. **What changed & first-hand evidence**: real modified files (`gitStatus`), key commands run, and raw metrics/numbers.
-3. **Traceability pointer**: `host`, project path, `threadId` (`✦ ...`, viewable and resumable in Codex Desktop App), and `fullMessagePath`.
+3. **Traceability pointer (only when new or changed)**: include `host`, project, `model / effort`, `threadId` (`✦ ...`), and `fullMessagePath` on the first report or whenever any of them changes (or when asked); omit repeating unchanged metadata on subsequent wakeups of the same thread.
 4. **Decision / next step** (only when user input or a follow-up is needed).
 
 ### Document Output Policy

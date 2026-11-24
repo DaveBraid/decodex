@@ -14,6 +14,7 @@ Subcommands:
   watch     - Event-driven silent wait (0-token polling); wakes on mid-turn question,
               Guardian denial, turn completion, failure, or disconnect
   steer     - Mid-turn non-interrupting guidance (`turn/steer`, auto-falls back to `turn/start`)
+  fast      - Change a thread's service tier without sending input
   queue     - Queue next-turn follow-up via native `codex queue`
   approve   - Approve pending Guardian-denied action (`thread/approveGuardianDeniedAction`)
   interrupt - Interrupt an active turn (`turn/interrupt`)
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import json
 import os
 import select
@@ -53,6 +55,7 @@ IQ_CACHE = DECODEX_HOME / "codexradar_iq_cache.json"
 CODEXRADAR_IQ_URL = "https://codexradar.com/data/intelligence-trends.json"
 IQ_CACHE_TTL_SEC = 6 * 3600
 TITLE_PREFIX = os.environ.get("DECODEX_TITLE_PREFIX", "✦")
+SERVICE_TIERS = ("default", "fast", "priority")
 
 BUNDLED_MAC_CODEX = Path(
     "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
@@ -164,6 +167,41 @@ def save_json(path: Path, obj: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     tmp.replace(path)
+
+
+def record_service_tiers(
+    host: str,
+    thread_id: str,
+    service_tier: Optional[str],
+    turn_id: Optional[str] = None,
+    turn_service_tier: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    '''
+    归并线程档位与本 CLI 提交的单回合覆盖值，保留原有元数据。
+    输入主机、线程、线程档位和可选的回合档位及元数据。
+    输出 JSON 信封的档位字段，只在回合 ID 匹配时带上覆盖值。
+    '''
+    directory = thread_cache_dir(thread_id)
+    path = directory / "meta.json"
+    # 锁住目录，避免并发命令在读写元数据时丢失覆盖值。
+    lock_fd = os.open(directory, os.O_RDONLY)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        previous = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        meta = dict(previous) if previous.get("host") == host else {}
+        meta.update(metadata or {})
+        meta.update(host=host, threadId=thread_id, serviceTier=service_tier)
+        if turn_id and turn_service_tier is not None:
+            meta.update(turnServiceTier=turn_service_tier, turnServiceTierTurnId=turn_id)
+        if meta != previous:
+            save_json(path, meta)
+        fields = {"serviceTier": service_tier}
+        if turn_id and meta.get("turnServiceTierTurnId") == turn_id:
+            fields["turnServiceTier"] = meta["turnServiceTier"]
+        return fields
+    finally:
+        os.close(lock_fd)
 
 
 def save_text(path: Path, text: str) -> None:
@@ -672,6 +710,7 @@ def watch_thread(
     title: Optional[str] = None,
     timeout: float = 0.0,
     already_subscribed: bool = False,
+    tier_fields: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     cdir = thread_cache_dir(thread_id)
     if not already_subscribed:
@@ -785,6 +824,12 @@ def watch_thread(
         if msg_tid is None and isinstance(params.get("thread"), dict):
             msg_tid = params["thread"].get("id")
         if msg_tid and msg_tid != thread_id:
+            continue
+
+        if method == "thread/settings/updated" and tier_fields is not None:
+            # 等待期间可由另一个客户端更新线程档位。
+            value = (params.get("threadSettings") or {}).get("serviceTier")
+            tier_fields["serviceTier"] = normalize_service_tier(value)
             continue
 
         if method == "turn/started":
@@ -1068,6 +1113,29 @@ def cmd_models(args: argparse.Namespace) -> None:
     emit_json(out)
 
 
+def normalize_service_tier(value: Optional[str]) -> Optional[str]:
+    '''
+    将 CLI 的 fast 别名转换为 RPC 使用的 priority。
+    输入已由参数解析器校验的档位，输出发给 daemon 的值。
+    '''
+    return "priority" if value == "fast" else value
+
+
+def update_thread_service_tier(client: AppServerClient, thread_id: str, tier: str) -> str:
+    '''
+    更新已加载线程的默认档位，再用 resume 读取并缓存 daemon 的实际值。
+    输入客户端、线程及目标档位，输出确认后的档位。
+    '''
+    client.request("thread/settings/update", {"threadId": thread_id, "serviceTier": tier})
+    # 更新返回空对象，thread/read 在 0.171 也没有档位字段。
+    resumed = client.request("thread/resume", {"threadId": thread_id, "excludeTurns": True})
+    actual = resumed.get("serviceTier")
+    if actual != tier:
+        raise DeCodexError(f"Thread service tier readback differs: requested {tier!r}, got {actual!r}")
+    record_service_tiers(client.host, thread_id, actual)
+    return actual
+
+
 def cmd_start(args: argparse.Namespace) -> None:
     cwd, proj_name = resolve_project_dir(args.host, args.dir, args.project)
     prompt = read_prompt_arg(args.prompt, args.prompt_file)
@@ -1087,6 +1155,8 @@ def cmd_start(args: argparse.Namespace) -> None:
             start_params["model"] = args.model
         if args.sandbox:
             start_params["sandbox"] = args.sandbox
+        if args.service_tier is not None:
+            start_params["serviceTier"] = args.service_tier
 
         res = client.request("thread/start", start_params)
         thread = res.get("thread") or {}
@@ -1110,6 +1180,8 @@ def cmd_start(args: argparse.Namespace) -> None:
             turn_params["model"] = args.model
         if args.effort:
             turn_params["effort"] = args.effort
+        if args.turn_service_tier is not None:
+            turn_params["serviceTierForTurn"] = args.turn_service_tier
 
         turn_res = client.request("turn/start", turn_params)
         turn = turn_res.get("turn") or {}
@@ -1117,11 +1189,13 @@ def cmd_start(args: argparse.Namespace) -> None:
         resolved_model = args.model or res.get("model") or thread.get("model")
         resolved_effort = args.effort or res.get("reasoningEffort")
 
-        save_json(
-            thread_cache_dir(thread_id) / "meta.json",
-            {
-                "host": args.host,
-                "threadId": thread_id,
+        tier_fields = record_service_tiers(
+            args.host,
+            thread_id,
+            res.get("serviceTier"),
+            turn_id,
+            args.turn_service_tier,
+            metadata={
                 "cwd": cwd,
                 "projectName": proj_name,
                 "title": title,
@@ -1142,6 +1216,7 @@ def cmd_start(args: argparse.Namespace) -> None:
                     "title": title,
                     "model": resolved_model,
                     "effort": resolved_effort,
+                    **tier_fields,
                 }
             )
             return
@@ -1154,9 +1229,13 @@ def cmd_start(args: argparse.Namespace) -> None:
             title=title,
             timeout=args.timeout,
             already_subscribed=True,
+            tier_fields=tier_fields,
         )
         env["model"] = resolved_model
         env["effort"] = resolved_effort
+        if env.get("turnId") != turn_id:
+            tier_fields.pop("turnServiceTier", None)
+        env.update(tier_fields)
         emit_json(env)
     finally:
         client.close()
@@ -1192,6 +1271,13 @@ def cmd_steer(args: argparse.Namespace) -> None:
         title = title or thread_obj.get("name")
         active_turn_id = get_active_turn_id(thread_obj)
         last_item_id, _ = extract_latest_agent_message(thread_obj.get("turns") or [])
+        if active_turn_id and args.turn_service_tier is not None:
+            # 单回合档位只在 turn/start 创建回合时生效。
+            raise DeCodexError("A turn is active. A one-turn service tier requires a new turn; retry after it completes.")
+
+        service_tier = resumed.get("serviceTier")
+        if args.service_tier is not None:
+            service_tier = update_thread_service_tier(client, args.thread, args.service_tier)
 
         mode_used = "turn/start"
         turn_id = active_turn_id
@@ -1203,6 +1289,8 @@ def cmd_steer(args: argparse.Namespace) -> None:
             turn_start_params["model"] = args.model
         if args.effort:
             turn_start_params["effort"] = args.effort
+        if args.turn_service_tier is not None:
+            turn_start_params["serviceTierForTurn"] = args.turn_service_tier
         model_note = None
 
         if active_turn_id:
@@ -1230,6 +1318,9 @@ def cmd_steer(args: argparse.Namespace) -> None:
 
         resolved_model = args.model or resumed.get("model") or thread_obj.get("model")
         resolved_effort = args.effort or resumed.get("reasoningEffort")
+        tier_fields = record_service_tiers(
+            args.host, args.thread, service_tier, turn_id, args.turn_service_tier,
+        )
 
         if not args.watch:
             out_steered: Dict[str, Any] = {
@@ -1242,6 +1333,7 @@ def cmd_steer(args: argparse.Namespace) -> None:
                 "title": title,
                 "model": resolved_model,
                 "effort": resolved_effort,
+                **tier_fields,
             }
             if model_note:
                 out_steered["modelNote"] = model_note
@@ -1257,13 +1349,38 @@ def cmd_steer(args: argparse.Namespace) -> None:
             title=title,
             timeout=args.timeout,
             already_subscribed=True,
+            tier_fields=tier_fields,
         )
         env["steerMode"] = mode_used
         env["model"] = resolved_model
         env["effort"] = resolved_effort
+        if env.get("turnId") != turn_id:
+            tier_fields.pop("turnServiceTier", None)
+        env.update(tier_fields)
         if model_note:
             env["modelNote"] = model_note
         emit_json(env)
+    finally:
+        client.close()
+
+
+def cmd_fast(args: argparse.Namespace) -> None:
+    '''
+    热更新线程默认档位，保留正在执行的回合。
+    输入主机、线程和目标档位，输出包含活动回合 ID 的 JSON。
+    '''
+    client = AppServerClient(args.host)
+    try:
+        client.request("thread/resume", {"threadId": args.thread, "excludeTurns": True})
+        tier = update_thread_service_tier(client, args.thread, args.service_tier)
+        result = client.request("thread/read", {"threadId": args.thread, "includeTurns": True})
+        emit_json({
+            "event": "SERVICE_TIER_UPDATED",
+            "host": args.host,
+            "threadId": args.thread,
+            "serviceTier": tier,
+            "activeTurnId": get_active_turn_id(result.get("thread") or {}),
+        })
     finally:
         client.close()
 
@@ -1460,6 +1577,13 @@ def cmd_status(args: argparse.Namespace) -> None:
         turns = thread_obj.get("turns") or []
         latest_turn = turns[-1] if turns else {}
         last_item_id, last_text = extract_latest_agent_message(turns)
+        if "serviceTier" in thread_obj:
+            service_tier = thread_obj["serviceTier"]
+        else:
+            # 0.171 通过 resume 的响应暴露线程设置。省略覆盖值即保留现有档位。
+            resumed = client.request("thread/resume", {"threadId": args.thread, "excludeTurns": True})
+            service_tier = resumed.get("serviceTier")
+        tier_fields = record_service_tiers(args.host, args.thread, service_tier, latest_turn.get("id"))
         env = build_envelope(
             "STATUS",
             args.host,
@@ -1475,6 +1599,7 @@ def cmd_status(args: argparse.Namespace) -> None:
                 "turnError": latest_turn.get("error"),
                 "activeTurnId": get_active_turn_id(thread_obj),
                 "gitStatus": get_git_status_summary(args.host, thread_obj.get("cwd")),
+                **tier_fields,
             },
         )
         emit_json(env)
@@ -1551,6 +1676,7 @@ def _check_local_schema(codex_bin: str) -> Dict[str, Any]:
         "turn/steer",
         "turn/interrupt",
         "thread/approveGuardianDeniedAction",
+        "thread/settings/update",
     }
     required_notif = {
         "turn/started",
@@ -1559,6 +1685,7 @@ def _check_local_schema(codex_bin: str) -> Dict[str, Any]:
         "item/autoApprovalReview/completed",
         "autoApprovalReview/strictReviewRequired",
         "thread/queue/changed",
+        "thread/settings/updated",
     }
     required_server_req = {
         "item/tool/requestUserInput",
@@ -1566,7 +1693,7 @@ def _check_local_schema(codex_bin: str) -> Dict[str, Any]:
     }
     with tempfile.TemporaryDirectory(prefix="decodex-schema-") as td:
         proc = subprocess.run(
-            [codex_bin, "app-server", "generate-json-schema", "--out", td],
+            [codex_bin, "app-server", "generate-json-schema", "--experimental", "--out", td],
             capture_output=True,
             text=True,
             timeout=20,
@@ -1607,6 +1734,16 @@ def _check_local_schema(codex_bin: str) -> Dict[str, Any]:
             field_checks["guardianReview.review"] = "review" in (ga.get("properties") or {})
         except Exception:
             field_checks["guardianReview.schema"] = False
+
+        for schema, field in (
+            ("ThreadStartParams", "serviceTier"),
+            ("ThreadResumeResponse", "serviceTier"),
+            ("ThreadSettingsUpdateParams", "serviceTier"),
+            ("TurnStartParams", "serviceTierForTurn"),
+        ):
+            path = tdp / "v2" / f"{schema}.json"
+            properties = json.loads(path.read_text(encoding="utf-8")).get("properties", {}) if path.is_file() else {}
+            field_checks[f"{schema}.{field}"] = field in properties
 
         ok = not (missing_client or missing_notif or missing_sreq) and all(field_checks.values())
         return {
@@ -1715,6 +1852,23 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     emit_json(report)
 
 
+def add_service_tier_flags(parser: argparse.ArgumentParser) -> None:
+    '''
+    为 start 和 steer 注册线程档位与单回合档位参数。
+    各组内部互斥，两组可同时使用。
+    '''
+    thread = parser.add_mutually_exclusive_group()
+    thread.add_argument("--fast", dest="service_tier", action="store_const", const="priority",
+                        help="Enable Fast for the thread")
+    thread.add_argument("--service-tier", type=normalize_service_tier, choices=SERVICE_TIERS,
+                        help="Set the thread's default service tier")
+    turn = parser.add_mutually_exclusive_group()
+    turn.add_argument("--fast-once", dest="turn_service_tier", action="store_const", const="priority",
+                      help="Enable Fast for a newly started turn only")
+    turn.add_argument("--turn-service-tier", type=normalize_service_tier, choices=SERVICE_TIERS,
+                      help="Override the service tier for a newly started turn only")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="decodex", description="DeCodex: Agent <-> Codex app-server bridge")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1740,6 +1894,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--prompt-file", default=None, help="Read prompt text from file (or - for stdin)")
     sp.add_argument("--model", default=None, help="Optional model override")
     sp.add_argument("--effort", default=None, help="Optional reasoning effort override")
+    add_service_tier_flags(sp)
     sp.add_argument("--sandbox", default=None, choices=["read-only", "workspace-write", "danger-full-access"])
     sp.add_argument("--approval-policy", default="on-request", choices=["on-request", "never", "untrusted"])
     sp.add_argument("--approvals-reviewer", default="auto_review", choices=["auto_review", "user", "guardian_subagent"])
@@ -1762,10 +1917,21 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--prompt-file", default=None)
     sp.add_argument("--model", default=None, help="Optional model override (applies when starting a new turn)")
     sp.add_argument("--effort", default=None, help="Optional reasoning effort override (applies when starting a new turn)")
+    add_service_tier_flags(sp)
     sp.add_argument("--watch", dest="watch", action="store_true", default=True)
     sp.add_argument("--no-watch", dest="watch", action="store_false")
     sp.add_argument("--timeout", type=float, default=0.0)
     sp.set_defaults(func=cmd_steer)
+
+    sp = sub.add_parser("fast", help="Change a thread's service tier without sending input")
+    sp.add_argument("--host", required=True)
+    sp.add_argument("--thread", required=True)
+    tier = sp.add_mutually_exclusive_group(required=True)
+    tier.add_argument("--on", dest="service_tier", action="store_const", const="priority", help="Enable Fast")
+    tier.add_argument("--off", dest="service_tier", action="store_const", const="default", help="Set standard speed")
+    tier.add_argument("--tier", dest="service_tier", type=normalize_service_tier, choices=SERVICE_TIERS,
+                      help="Set the thread's default service tier")
+    sp.set_defaults(func=cmd_fast)
 
     sp = sub.add_parser("queue", help="Queue follow-up message for after current turn ends")
     sp.add_argument("--host", required=True)

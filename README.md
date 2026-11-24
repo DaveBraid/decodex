@@ -104,6 +104,21 @@ decodex inspect --host my-gpu-box --thread <thread-id> --saved
 decodex inspect --host my-gpu-box --thread <thread-id> --limit 10
 ```
 
+### Fast mode
+
+Leave Fast off by default to conserve quota. Enable it when the user explicitly requests it or the task is especially urgent.
+
+- Add `--fast` to `start` or `steer` to set the thread default. `--service-tier default` switches the thread to standard speed while sending your prompt.
+- Add `--fast-once` to `start` or to `steer` when the thread is idle. This sets `serviceTierForTurn` for the new turn. Use `--turn-service-tier default` for one standard-speed turn on a Fast thread. If `steer` finds an active turn, it reports an error before sending the prompt.
+- Use `decodex fast` to change the thread default during an active turn. The command sends no prompt and the running turn continues with its existing settings.
+
+```bash
+decodex fast --host local --thread <thread-id> --on
+decodex fast --host local --thread <thread-id> --off
+```
+
+The explicit tier flags (`--service-tier`, `--turn-service-tier`, and `fast --tier`) accept `default`, `fast`, or `priority`. DeCodex sends `priority` for Fast and `default` for standard speed. The CLI inherits the daemon's thread defaults when tier flags are omitted. `start`, `steer`, and `status` report the thread's `serviceTier`. When a turn has a CLI override, the matching result also reports `turnServiceTier`. The cached `meta.json` associates the last override with `turnServiceTierTurnId`. The native settings RPC was tested with Codex 0.171.
+
 ## Configuration (Environment Variables)
 
 | Variable | Default | Description |

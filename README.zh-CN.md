@@ -103,6 +103,21 @@ decodex inspect --host my-gpu-box --thread <thread-id> --saved
 decodex inspect --host my-gpu-box --thread <thread-id> --limit 10
 ```
 
+### Fast 模式
+
+默认不开 Fast，以节省额度。仅在用户明确要求或任务特别紧急时开启。
+
+- 在 `start` 或 `steer` 上加 `--fast`，将线程默认档位设为 Fast。发送提示词时可用 `--service-tier default` 切回标准速度。
+- 在 `start` 或线程空闲时的 `steer` 上加 `--fast-once`，通过 `serviceTierForTurn` 给新回合临时提速。Fast 线程可用 `--turn-service-tier default` 单回合使用标准速度。如果 `steer` 发现已有活动回合，会在发送提示词前报错。
+- 用 `decodex fast` 可以在回合运行中更新线程默认档位。命令不发送提示词，运行中的回合沿用原有设置继续执行。
+
+```bash
+decodex fast --host local --thread <thread-id> --on
+decodex fast --host local --thread <thread-id> --off
+```
+
+`--service-tier`、`--turn-service-tier` 和 `fast --tier` 接受 `default`、`fast` 或 `priority`。DeCodex 用 `priority` 请求 Fast，用 `default` 请求标准速度。省略档位参数时沿用 daemon 的默认设置。`start`、`steer` 和 `status` 返回线程的 `serviceTier`。CLI 指定过单回合档位时，对应回合的输出也包含 `turnServiceTier`。缓存 `meta.json` 用 `turnServiceTierTurnId` 标明最近一次单回合覆盖对应的回合。原生设置 RPC 已在 Codex 0.171 验证。
+
 ## 环境变量配置
 
 | 环境变量 | 默认值 | 说明 |
